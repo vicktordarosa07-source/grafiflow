@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#072d54" />
     <meta name="description" content="Cálculo offline de aproveitamento de bobinas e chapas, custos, instalação e lucratividade." />
-    <link rel="manifest" href="./manifest.webmanifest?v=20261003-grafiflow-cloud-sync-v1" />
+    <link rel="manifest" href="./manifest.webmanifest?v=20261004-account-v1" />
     <link rel="icon" href="./grafiflow-favicon-v3.png" type="image/png" sizes="64x64" />
     <link rel="apple-touch-icon" href="./grafiflow-icon-192-v3.png" />
     <link rel="stylesheet" href="./styles.css?v=20261003-grafiflow-cloud-sync-v1" />
@@ -219,19 +219,75 @@
           <div><span class="section-kicker">CONTA GRAFIFLOW</span><h2 id="account-modal-title">Entrar e sincronizar</h2><p id="account-modal-status" class="muted-copy">Seus dados continuam salvos neste dispositivo.</p></div>
           <button class="icon-button" id="close-account-modal" type="button" aria-label="Fechar">×</button>
         </div>
-        <form id="account-auth-form" class="account-auth-form">
-          <label class="field" id="auth-name-field" hidden><span>Seu nome</span><input id="auth-full-name" type="text" autocomplete="name" placeholder="Nome profissional" /></label>
-          <label class="field" id="auth-workspace-field" hidden><span>Nome da empresa ou espaço</span><input id="auth-workspace-name" type="text" autocomplete="organization" placeholder="Ex.: Minha gráfica" /></label>
-          <label class="field"><span>E-mail</span><input id="auth-email" type="email" autocomplete="username" required placeholder="voce@empresa.com" /></label>
-          <label class="field"><span>Senha</span><input id="auth-password" type="password" autocomplete="current-password" required minlength="1" placeholder="Sua senha" /></label>
-          <button class="primary-button account-submit" id="auth-submit" type="submit">Entrar</button>
-        </form>
-        <div class="account-modal-actions">
-          <button class="text-button" id="auth-mode-toggle" type="button">Criar conta</button>
-          <button class="secondary-button" id="auth-sync-now" type="button" hidden>Sincronizar agora</button>
-          <button class="secondary-button" id="auth-signout" type="button" hidden>Sair da conta</button>
-          <button class="secondary-button" id="cancel-account-modal" type="button">Fechar</button>
+        <div id="auth-login-view">
+          <form id="account-auth-form" class="account-auth-form">
+            <label class="field" id="auth-name-field" hidden><span>Seu nome</span><input id="auth-full-name" type="text" autocomplete="name" placeholder="Nome profissional" /></label>
+            <label class="field" id="auth-workspace-field" hidden><span>Nome da empresa ou espaço</span><input id="auth-workspace-name" type="text" autocomplete="organization" placeholder="Ex.: Minha gráfica" /></label>
+            <label class="field"><span>E-mail</span><input id="auth-email" type="email" autocomplete="username" required placeholder="voce@empresa.com" /></label>
+            <label class="field"><span>Senha</span><input id="auth-password" type="password" autocomplete="current-password" required minlength="8" placeholder="Sua senha" /></label>
+            <button class="primary-button account-submit" id="auth-submit" type="submit">Entrar</button>
+          </form>
+          <div class="account-modal-actions">
+            <button class="text-button" id="auth-mode-toggle" type="button">Criar conta</button>
+            <button class="text-button" id="auth-forgot-button" type="button">Esqueci minha senha</button>
+          </div>
         </div>
+        <form id="recovery-request-form" class="account-auth-form" hidden>
+          <label class="field"><span>E-mail cadastrado</span><input id="recover-email" type="email" autocomplete="email" required placeholder="voce@empresa.com" /></label>
+          <button class="primary-button account-submit" id="recover-submit" type="submit">Enviar link de recuperação</button>
+          <button class="text-button" id="auth-back-to-login" type="button">Voltar para entrar</button>
+        </form>
+        <form id="password-recovery-form" class="account-auth-form" hidden>
+          <label class="field"><span>Nova senha</span><input id="recovery-new-password" type="password" autocomplete="new-password" required minlength="8" placeholder="Mínimo de 8 caracteres" /></label>
+          <label class="field"><span>Confirme a nova senha</span><input id="recovery-confirm-password" type="password" autocomplete="new-password" required minlength="8" placeholder="Digite a nova senha novamente" /></label>
+          <button class="primary-button account-submit" id="recovery-submit" type="submit">Salvar nova senha</button>
+          <button class="text-button" id="recovery-back-to-login" type="button">Voltar para entrar</button>
+        </form>
+        <section id="account-settings-view" class="account-settings-view" hidden>
+          <p class="account-email-line">Conta: <strong id="account-email-display"></strong></p>
+          <form id="account-profile-form" class="account-auth-form">
+            <section class="client-form-section">
+              <span class="section-kicker">DADOS PESSOAIS</span><h3>Cadastro</h3>
+              <div class="form-grid two-columns account-form-grid">
+                <label class="field full-width"><span>Nome completo</span><input id="profile-full-name" type="text" autocomplete="name" maxlength="160" /></label>
+                <label class="field"><span>CPF</span><input id="profile-cpf" type="text" inputmode="numeric" autocomplete="off" maxlength="14" placeholder="000.000.000-00" /></label>
+                <label class="field"><span>Telefone / WhatsApp</span><input id="profile-phone" type="tel" autocomplete="tel" maxlength="32" /></label>
+                <label class="field"><span>CEP</span><input id="profile-postal-code" type="text" autocomplete="postal-code" maxlength="12" /></label>
+                <label class="field"><span>Estado</span><input id="profile-state" type="text" autocomplete="address-level1" maxlength="80" /></label>
+                <label class="field full-width"><span>Rua / Avenida</span><input id="profile-street" type="text" autocomplete="street-address" maxlength="180" /></label>
+                <label class="field"><span>Número</span><input id="profile-address-number" type="text" maxlength="30" /></label>
+                <label class="field"><span>Complemento</span><input id="profile-address-complement" type="text" maxlength="100" /></label>
+                <label class="field"><span>Bairro</span><input id="profile-neighborhood" type="text" maxlength="100" /></label>
+                <label class="field"><span>Cidade</span><input id="profile-city" type="text" autocomplete="address-level2" maxlength="100" /></label>
+              </div>
+            </section>
+            <section class="client-form-section">
+              <span class="section-kicker">PREENCHIMENTO AUTOMÁTICO</span><h3>Dados que podem aparecer nos orçamentos</h3>
+              <p class="material-note">Estes campos serão sugeridos como identificação do emissor e incluídos no PDF do orçamento.</p>
+              <div class="form-grid two-columns account-form-grid">
+                <label class="field full-width"><span>Empresa ou profissional</span><input id="profile-quote-business-name" type="text" autocomplete="organization" maxlength="160" /></label>
+                <label class="field"><span>Telefone comercial</span><input id="profile-quote-business-phone" type="tel" maxlength="32" /></label>
+                <label class="field"><span>E-mail comercial</span><input id="profile-quote-business-email" type="email" autocomplete="email" maxlength="254" /></label>
+                <label class="field"><span>CPF/CNPJ para o orçamento</span><input id="profile-quote-document" type="text" maxlength="24" /></label>
+                <label class="field"><span>Endereço comercial para o orçamento</span><input id="profile-quote-address" type="text" maxlength="240" /></label>
+              </div>
+            </section>
+            <button class="primary-button account-submit" id="profile-save-button" type="submit">Salvar dados da conta</button>
+          </form>
+          <form id="change-password-form" class="account-auth-form password-change-form">
+            <section class="client-form-section">
+              <span class="section-kicker">SEGURANÇA</span><h3>Trocar senha</h3>
+              <div class="form-grid account-form-grid">
+                <label class="field"><span>Senha atual</span><input id="password-current" type="password" autocomplete="current-password" required /></label>
+                <label class="field"><span>Nova senha</span><input id="password-new" type="password" autocomplete="new-password" required minlength="8" /></label>
+                <label class="field"><span>Confirme a nova senha</span><input id="password-confirm" type="password" autocomplete="new-password" required minlength="8" /></label>
+              </div>
+              <button class="primary-button account-submit" id="password-change-button" type="submit">Atualizar senha</button>
+            </section>
+          </form>
+          <div class="account-modal-actions"><button class="secondary-button" id="auth-sync-now" type="button">Sincronizar agora</button><button class="secondary-button" id="auth-signout" type="button">Sair da conta</button></div>
+        </section>
+        <div class="account-modal-actions account-close-actions"><button class="secondary-button" id="cancel-account-modal" type="button">Fechar</button></div>
         <p class="account-offline-note">O GrafiFlow funciona offline. A sincronização acontece quando houver internet; seus dados locais e o backup continuam disponíveis.</p>
       </div>
     </div>
@@ -246,7 +302,7 @@
         </div>
         <div class="client-quote-workspace">
           <section class="client-quote-editor" aria-label="Dados do orçamento para o cliente">
-            <div class="client-form-section"><span class="section-kicker">IDENTIFICAÇÃO</span><h3>Quem está enviando?</h3><div class="form-grid two-columns client-form-grid"><label class="field full-width"><span>Nome da empresa ou profissional</span><input data-client-field="businessName" id="client-business-name" type="text" placeholder="Ex.: Helder Comunicação Visual" /></label><label class="field"><span>Telefone / WhatsApp</span><input data-client-field="businessPhone" id="client-business-phone" type="text" placeholder="(00) 00000-0000" /></label><label class="field"><span>E-mail</span><input data-client-field="businessEmail" id="client-business-email" type="email" placeholder="contato@empresa.com" /></label></div></div>
+            <div class="client-form-section"><span class="section-kicker">IDENTIFICAÇÃO</span><h3>Quem está enviando?</h3><div class="form-grid two-columns client-form-grid"><label class="field full-width"><span>Nome da empresa ou profissional</span><input data-client-field="businessName" id="client-business-name" type="text" placeholder="Ex.: Helder Comunicação Visual" /></label><label class="field"><span>Telefone / WhatsApp</span><input data-client-field="businessPhone" id="client-business-phone" type="text" placeholder="(00) 00000-0000" /></label><label class="field"><span>E-mail</span><input data-client-field="businessEmail" id="client-business-email" type="email" placeholder="contato@empresa.com" /></label><label class="field"><span>CPF/CNPJ</span><input data-client-field="businessDocument" id="client-business-document" type="text" /></label><label class="field full-width"><span>Endereço comercial</span><input data-client-field="businessAddress" id="client-business-address" type="text" /></label></div></div>
             <div class="client-form-section"><span class="section-kicker">CLIENTE</span><h3>Para quem é o orçamento?</h3><div class="form-grid two-columns client-form-grid"><label class="field full-width"><span>Nome do cliente</span><input data-client-field="clientName" id="client-name" type="text" placeholder="Nome ou empresa do cliente" /></label><label class="field full-width"><span>Telefone / WhatsApp do cliente</span><input data-client-field="clientContact" id="client-contact" type="text" placeholder="Opcional" /></label></div></div>
             <div class="client-form-section"><span class="section-kicker">CONDIÇÕES</span><h3>Combine os detalhes</h3><div class="form-grid two-columns client-form-grid"><label class="field"><span>Validade do orçamento</span><input data-client-field="validity" id="client-validity" type="text" placeholder="Ex.: 7 dias" /></label><label class="field"><span>Prazo de produção/instalação</span><input data-client-field="deadline" id="client-deadline" type="text" placeholder="Ex.: até 5 dias úteis" /></label><label class="field full-width"><span>Forma de pagamento</span><input data-client-field="paymentTerms" id="client-payment-terms" type="text" placeholder="Ex.: 50% de entrada e saldo na entrega" /></label><label class="field full-width"><span>Observações</span><textarea data-client-field="notes" id="client-notes" rows="3" placeholder="Informações importantes para o cliente"></textarea></label></div></div>
           </section>

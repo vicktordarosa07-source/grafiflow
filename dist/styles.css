@@ -290,6 +290,7 @@ input:disabled, select:disabled { color: #8195a1; background: #edf3f6; }
 .client-doc-brand-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 8px; color: #072d54; background: #35bdc4; font-weight: 900; font-size: 1.14rem; }
 .client-doc-business { font-weight: 850; font-size: 0.93rem; }
 .client-doc-contact { color: #60778b; font-size: 0.67rem; line-height: 1.5; margin-top: 3px; }
+.client-doc-business-detail { color: #60778b; font-size: 0.67rem; line-height: 1.5; margin-top: 2px; }
 .client-doc-type { color: #60778b; font-size: 0.68rem; font-weight: 800; letter-spacing: 0.12em; text-align: right; }
 .client-doc-number { color: #0b3d6b; font-size: 0.72rem; font-weight: 750; text-align: right; margin-top: 6px; }
 .client-doc-intro { margin: 25px 0 21px; }
@@ -416,11 +417,18 @@ input:disabled, select:disabled { color: #8195a1; background: #edf3f6; }
 }
 
 .account-button { white-space: nowrap; }
-.account-modal-card { width: min(480px, 100%); }
+.account-modal-card { width: min(650px, 100%); }
 .account-auth-form { display: grid; gap: 14px; margin-top: 20px; }
 .account-auth-form .field { min-width: 0; }
 .account-submit { width: 100%; margin-top: 3px; }
 .account-modal-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 15px; }
+.account-settings-view:not([hidden]) { display: grid; gap: 16px; }
+.account-form-grid { gap: 10px; }
+.account-email-line { margin: 0; color: var(--muted); font-size: 0.78rem; }
+.account-email-line strong { color: var(--ink); }
+.password-change-form { padding-top: 16px; border-top: 1px solid var(--line); }
+.account-close-actions { justify-content: flex-end; }
+#auth-login-view[hidden], #recovery-request-form[hidden], #password-recovery-form[hidden], #account-settings-view[hidden] { display: none !important; }
 .account-offline-note { margin: 20px 0 0; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.74rem; line-height: 1.5; }
 
 @media (max-width: 650px) {

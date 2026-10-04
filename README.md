@@ -20,9 +20,9 @@ Sem as duas variáveis, o app é publicado e funciona localmente, mas a conta e 
 
 ## Supabase
 
-Aplique `supabase/migrations/202610030001_grafiflow_core.sql` no projeto Supabase. A migração cria perfis, espaços de trabalho, membros, registros sincronizados, políticas RLS e uma tabela neutra de assinaturas. Cada conta nova recebe seu próprio espaço de trabalho. A tabela de assinatura ainda não ativa cobrança nem define planos/preços.
+Aplique, nesta ordem, `supabase/migrations/202610030001_grafiflow_core.sql` e `supabase/migrations/202610040001_account_profiles.sql` no projeto Supabase. A primeira migração cria perfis, espaços de trabalho, membros, registros sincronizados, políticas RLS e uma tabela neutra de assinaturas; a segunda adiciona os dados de cadastro e preenchimento de orçamento ao perfil privado do titular. Cada conta nova recebe seu próprio espaço de trabalho. A tabela de assinatura ainda não ativa cobrança nem define planos/preços.
 
-Configure a URL do site publicado nas URLs de redirecionamento/autorização do Supabase. O app usa autenticação por e-mail e senha; conforme a configuração de confirmação de e-mail do projeto, o usuário pode precisar confirmar o endereço antes do primeiro acesso.
+Configure `https://grafiflow.vercel.app` como Site URL e permita essa origem nas Redirect URLs. Em Auth > Providers > Email, mantenha a confirmação de e-mail ativada. Em Auth > Email Templates, use `{{ .ConfirmationURL }}` como destino de um botão “Confirmar cadastro” no modelo Confirm Signup e um botão “Redefinir senha” no modelo Reset Password. Para entrega confiável de mensagens a usuários reais, configure SMTP próprio em Auth > SMTP Settings; o envio padrão do Supabase é restrito e não é adequado para produção.
 
 ## Configuração inicial das plataformas
 
