@@ -79,6 +79,7 @@ let savedQuotes = [];
 let computed = emptyComputed();
 let dbPromise;
 let draftTimer;
+let quoteCalculationTimer;
 let deferredInstallPrompt = null;
 let cloudSession = null;
 let cloudWorkspaceId = '';
@@ -1749,9 +1750,19 @@ function renderResults() {
 }
 
 function calculateAndRender({ persistDraft = true } = {}) {
+  if (quoteCalculationTimer) clearTimeout(quoteCalculationTimer);
+  quoteCalculationTimer = null;
   computed = calculateQuote();
   renderResults();
   if (persistDraft) persistDraftSoon();
+}
+
+function scheduleQuoteCalculation() {
+  if (quoteCalculationTimer) clearTimeout(quoteCalculationTimer);
+  quoteCalculationTimer = setTimeout(() => {
+    quoteCalculationTimer = null;
+    calculateAndRender();
+  }, 180);
 }
 
 function buildItemsForMaterial(material) {
@@ -2350,6 +2361,12 @@ function updateMaterialFromElement(element) {
     const card = [...document.querySelectorAll('[data-material-card]')].find((item) => item.dataset.materialCard === material.id);
     const title = card?.querySelector('.material-title');
     if (title) title.textContent = material.name || 'Material';
+    document.querySelectorAll('[data-piece-field="materialId"]').forEach((select) => {
+      [...select.options].forEach((option, optionIndex) => {
+        const optionMaterial = state.materials.find((candidate) => candidate.id === option.value) || state.materials[optionIndex];
+        if (optionMaterial) option.textContent = optionMaterial.name || 'Material';
+      });
+    });
   }
 }
 
@@ -2390,7 +2407,7 @@ function updateDirectField(element) {
   if (id === 'target-margin') state.targetMargin = Math.min(99.9, Math.max(0, num(element.value, 35)));
 }
 
-function handleFieldEvent(element) {
+function handleFieldEvent(element, { recalculate = true } = {}) {
   if (element.id === 'saved-material-calculation-mode' || element.id === 'saved-material-basis') {
     syncSavedMaterialFormMode();
     return;
@@ -2416,7 +2433,7 @@ function handleFieldEvent(element) {
   else if (element.dataset.pieceId) updatePieceFromElement(element);
   else if (element.dataset.supplyId) updateSupplyFromElement(element);
   else updateDirectField(element);
-  calculateAndRender();
+  if (recalculate) calculateAndRender();
 }
 
 function toggleButton(button, active) {
@@ -2836,6 +2853,13 @@ function handleClick(event) {
 function handleInput(event) {
   const element = event.target;
   if (!(element.matches('input, select, textarea'))) return;
+  if (element.closest('#saved-material-form') && element.dataset.savedTierIndex === undefined && !['saved-material-calculation-mode', 'saved-material-basis'].includes(element.id)) return;
+  if (event.type === 'input' && element instanceof HTMLInputElement && (element.dataset.materialId || element.dataset.pieceId)) {
+    handleFieldEvent(element, { recalculate: false });
+    scheduleQuoteCalculation();
+    return;
+  }
+  if (event.type === 'input' && element instanceof HTMLSelectElement) return;
   handleFieldEvent(element);
   if (element.id === 'profile-postal-code') lookupAddressFromPostalCode(element);
 }
@@ -2898,7 +2922,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-multi-material-layout-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-material-input-flow-v1').catch(() => undefined);
 }
 
 initialize();
