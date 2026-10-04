@@ -424,6 +424,7 @@ input:disabled, select:disabled { color: #8195a1; background: #edf3f6; }
 .account-modal-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 15px; }
 .account-settings-view:not([hidden]) { display: grid; gap: 16px; }
 .account-form-grid { gap: 10px; }
+.account-cep-status { display: block; margin-top: 4px; color: var(--muted); font-size: 0.68rem; line-height: 1.35; }
 .account-email-line { margin: 0; color: var(--muted); font-size: 0.78rem; }
 .account-email-line strong { color: var(--ink); }
 .password-change-form { padding-top: 16px; border-top: 1px solid var(--line); }

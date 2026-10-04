@@ -88,6 +88,8 @@ let suppressCloudQueue = false;
 let authMode = 'login';
 let authNotice = '';
 let accountProfile = null;
+let postalLookupController = null;
+let postalLookupSequence = 0;
 
 function uid(prefix) {
   const random = Math.random().toString(36).slice(2, 8);
@@ -430,6 +432,60 @@ function validCpf(value) {
 
 function profileValue(id) {
   return String(document.getElementById(id)?.value || '').trim();
+}
+
+async function lookupAddressFromPostalCode(element) {
+  const digits = String(element.value || '').replace(/\D/g, '');
+  if (digits.length === 8 && element.dataset.lastLookupCep === digits) return;
+  postalLookupController?.abort();
+  postalLookupController = null;
+  const sequence = ++postalLookupSequence;
+  const status = document.getElementById('profile-cep-status');
+  if (digits.length !== 8) {
+    if (status) status.textContent = digits ? 'Digite os 8 números do CEP para buscar o endereço.' : 'Preencha o CEP para sugerir o endereço.';
+    return;
+  }
+  const controller = new AbortController();
+  postalLookupController = controller;
+  element.dataset.lastLookupCep = digits;
+  if (status) status.textContent = 'Buscando endereço pelo CEP…';
+  try {
+    const response = await fetch(`https://viacep.com.br/ws/${digits}/json/`, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error('O serviço de CEP está indisponível no momento.');
+    const address = await response.json();
+    if (sequence !== postalLookupSequence) return;
+    if (address.erro) {
+      element.dataset.lastLookupCep = '';
+      if (status) status.textContent = 'CEP não encontrado. Confira os números ou preencha o endereço manualmente.';
+      return;
+    }
+
+    const fields = {
+      'profile-street': address.logradouro || '',
+      'profile-neighborhood': address.bairro || '',
+      'profile-city': address.localidade || '',
+      'profile-state': address.uf || '',
+    };
+    for (const [id, value] of Object.entries(fields)) {
+      const input = document.getElementById(id);
+      if (!input) continue;
+      const previousLookupValue = input.dataset.cepAutoFilled || '';
+      if (!input.value.trim() || input.value.trim() === previousLookupValue) {
+        input.value = value;
+        input.dataset.cepAutoFilled = value;
+      }
+    }
+    if (status) status.textContent = 'Endereço encontrado. Confira os dados e informe o número/complemento.';
+  } catch (error) {
+    if (error.name === 'AbortError' || sequence !== postalLookupSequence) return;
+    element.dataset.lastLookupCep = '';
+    if (status) status.textContent = 'Não foi possível consultar o CEP. Você pode preencher o endereço manualmente.';
+  } finally {
+    if (sequence === postalLookupSequence) postalLookupController = null;
+  }
 }
 
 function fillAccountProfileForm() {
@@ -2764,6 +2820,7 @@ function handleInput(event) {
   const element = event.target;
   if (!(element.matches('input, select, textarea'))) return;
   handleFieldEvent(element);
+  if (element.id === 'profile-postal-code') lookupAddressFromPostalCode(element);
 }
 
 function clearPresetTextOnFocus(event) {
@@ -2824,7 +2881,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-account-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-cep-lookup-v1').catch(() => undefined);
 }
 
 initialize();
