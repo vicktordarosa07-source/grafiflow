@@ -5,6 +5,7 @@ const CLOUD_SESSION_KEY = 'grafiflow.auth.v1';
 const CLOUD_WORKSPACE_KEY = 'grafiflow.workspace.v1';
 const CLOUD_OWNER_KEY = 'grafiflow.local.owner.v1';
 const MATERIAL_COLORS = ['#0a97e0', '#35bdc4', '#072d54', '#f5c51d', '#e52b7a', '#3d82b5', '#0f9f8a', '#6a78d4'];
+const PIECE_COLORS = ['#0a97e0', '#e52b7a', '#0f9f8a', '#f59e0b', '#6a78d4', '#d946ef', '#16a6a1', '#ef4444', '#3d82b5', '#84a21b', '#a855f7', '#ea580c', '#0891b2', '#be123c', '#4f46e5', '#65a30d'];
 
 const defaultMaterial = () => ({
   id: uid('mat'),
@@ -200,6 +201,10 @@ function escapeXml(value) {
 
 function materialColor(index) {
   return MATERIAL_COLORS[index % MATERIAL_COLORS.length];
+}
+
+function pieceColor(index) {
+  return PIECE_COLORS[index % PIECE_COLORS.length];
 }
 
 function materialLabelColor(color) {
@@ -1657,9 +1662,8 @@ function renderLayoutSvg(result, compact = false, layoutOverride = null, fixedHe
   const width = result.rollWidth;
   const height = positive(fixedHeight) || layout.usedLength;
   const maxHeight = compact ? 520 : 820;
-  const resultColorIndex = result.material?.id ? materialIndex(result.material.id) : null;
   const svgItems = layout.items.map((item) => {
-    const color = materialColor(resultColorIndex ?? item.colorIndex);
+    const color = pieceColor(item.colorIndex);
     const labelColor = materialLabelColor(color);
     const actualX = item.x + item.pad;
     const actualY = item.y + item.pad;
@@ -1708,18 +1712,31 @@ function renderLayout() {
     legend.innerHTML = '';
     return;
   }
-  container.innerHTML = computed.materialResults.map((result) => renderMaterialResultBlock(result, true)).join('');
+  const resultsByMaterial = new Map(computed.materialResults.map((result) => [result.material.id, result]));
+  const laminationMaterialIds = new Set(state.materials.map((material) => material.laminationMaterialId).filter(Boolean));
+  const baseMaterials = state.materials.filter((material) => resultsByMaterial.has(material.id) || !laminationMaterialIds.has(material.id));
+  container.innerHTML = baseMaterials.map((material) => {
+    const result = resultsByMaterial.get(material.id);
+    if (result) return renderMaterialResultBlock(result, true);
+    const dimensions = material.calculationMode === 'sheet'
+      ? `chapa de ${formatNumber(positive(material.widthCm), 1)} × ${formatNumber(positive(material.heightCm), 1)} cm`
+      : `bobina de ${formatNumber(positive(material.widthCm), 1)} cm`;
+    return `<div class="layout-block"><div class="layout-block-title">Base — ${escapeHtml(material.name)} · ${dimensions}</div><div class="canvas-placeholder">Vincule peças produzidas a este material para visualizar o aproveitamento.</div></div>`;
+  }).join('');
   const seen = new Map();
-  const addMaterialToLegend = (result) => {
-    if (!result?.material || result.areaOnly) return;
-    const hasPlacedItems = result.layout?.items?.length || result.layouts?.some((layout) => layout.items.length);
-    if (hasPlacedItems) seen.set(result.material.id, result.material);
+  const addPiecesToLegend = (result) => {
+    if (!result || result.areaOnly) return;
+    const items = [...(result.layout?.items || []), ...(result.layouts || []).flatMap((layout) => layout.items || [])];
+    items.forEach((item) => {
+      const piece = state.pieces.find((candidate) => candidate.id === item.pieceId);
+      if (piece) seen.set(piece.id, { piece, colorIndex: item.colorIndex });
+    });
   };
   computed.materialResults.forEach((result) => {
-    addMaterialToLegend(result);
-    addMaterialToLegend(result.laminationResult);
+    addPiecesToLegend(result);
+    addPiecesToLegend(result.laminationResult);
   });
-  legend.innerHTML = [...seen.values()].map((material) => `<span class="legend-item"><i class="legend-swatch" style="background:${materialColor(materialIndex(material.id))}"></i>${escapeHtml(material.name)}</span>`).join('');
+  legend.innerHTML = [...seen.values()].map(({ piece, colorIndex }) => `<span class="legend-item"><i class="legend-swatch" style="background:${pieceColor(colorIndex)}"></i>${escapeHtml(piece.description || 'Peça')} · ${formatNumber(positive(piece.widthCm), 1)}×${formatNumber(positive(piece.heightCm), 1)} cm</span>`).join('');
 }
 
 function renderResults() {
@@ -1758,7 +1775,7 @@ function buildItemsForMaterial(material) {
         pad: padding,
         outerW: originalW + padding * 2,
         outerH: originalH + padding * 2,
-        colorIndex: materialIndex(material.id),
+        colorIndex: Math.max(0, state.pieces.findIndex((candidate) => candidate.id === piece.id)),
       });
     }
   });
@@ -2881,7 +2898,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-cep-lookup-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-multi-material-layout-v1').catch(() => undefined);
 }
 
 initialize();
