@@ -90,6 +90,7 @@ let cloudSyncRunning = false;
 let cloudSyncRequested = false;
 let cloudSyncChannel = null;
 let cloudPollTimer = null;
+let fullSyncRunning = false;
 let authMode = 'login';
 let authNotice = '';
 let accountProfile = null;
@@ -589,12 +590,54 @@ async function usableCloudSession() {
 }
 
 function scheduleCloudSync() {
-  if (!cloudSession || !cloudWorkspaceId || !navigator.onLine || !cloudConfigured()) return;
+  if (fullSyncRunning || !cloudSession || !cloudWorkspaceId || !navigator.onLine || !cloudConfigured()) return;
   clearTimeout(cloudSyncTimer);
   cloudSyncTimer = setTimeout(() => syncCloudNow().catch((error) => {
     console.warn('A sincronização será retomada quando houver conexão.', error);
     updateAccountStatus('Sincronização pendente. Tentaremos novamente automaticamente.');
   }), 900);
+}
+
+async function synchronizeAllData() {
+  if (fullSyncRunning) return;
+  if (!cloudSession?.access_token) {
+    openAccountModal();
+    showToast('Entre na sua conta para sincronizar os dados entre o PWA e o SaaS web.', 'error');
+    return;
+  }
+  if (!navigator.onLine) {
+    showToast('Conecte-se à internet para sincronizar. Seus dados continuam salvos neste dispositivo.', 'error');
+    return;
+  }
+  fullSyncRunning = true;
+  clearTimeout(cloudSyncTimer);
+  updateAccountStatus('Preparando todos os dados deste dispositivo…');
+  const buttons = ['manual-sync-button', 'auth-sync-now'];
+  buttons.forEach((id) => {
+    const button = document.getElementById(id);
+    if (button) button.textContent = 'Sincronizando…';
+  });
+  try {
+    clearTimeout(draftTimer);
+    draftTimer = null;
+    await storePut('settings', { key: 'draft', value: clone(state), updatedAt: new Date().toISOString(), cloudIntent: true });
+    if (!cloudWorkspaceId) await getWorkspaceMembership();
+    await queueLocalDataForFirstSync();
+    await syncCloudNow();
+    showToast('Sincronização concluída. As alterações locais e remotas foram comparadas e atualizadas.');
+  } catch (error) {
+    console.error('Falha ao sincronizar todos os dados.', error);
+    showToast(error.message || 'Não foi possível concluir a sincronização.', 'error');
+  } finally {
+    fullSyncRunning = false;
+    buttons.forEach((id) => {
+      const button = document.getElementById(id);
+      if (button) button.textContent = id === 'manual-sync-button' ? '⟳ Sincronizar' : 'Sincronizar agora';
+    });
+    updateAccountStatus();
+    const pending = await storeGetAll('syncQueue').catch(() => []);
+    if (pending.length) scheduleCloudSync();
+  }
 }
 
 function syncAfterWake() {
@@ -884,6 +927,8 @@ function updateAccountStatus(message = '') {
   const status = document.getElementById('account-modal-status');
   const configured = cloudConfigured();
   const signedIn = Boolean(cloudSession?.user?.email || cloudSession?.user?.id);
+  const manualSync = document.getElementById('manual-sync-button');
+  if (manualSync) manualSync.disabled = !configured || !navigator.onLine || cloudSyncRunning || fullSyncRunning;
   if (button) {
     button.textContent = signedIn ? 'Minha conta' : 'Entrar e sincronizar';
     button.title = signedIn ? (cloudSession.user.email || cloudWorkspaceName || 'Conta GrafiFlow') : 'Entre para sincronizar seus dados entre dispositivos';
@@ -898,7 +943,7 @@ function updateAccountStatus(message = '') {
   const syncNow = document.getElementById('auth-sync-now');
   if (syncNow) {
     syncNow.hidden = !signedIn;
-    syncNow.disabled = !navigator.onLine || cloudSyncRunning || !cloudWorkspaceId;
+    syncNow.disabled = !navigator.onLine || cloudSyncRunning || fullSyncRunning || !cloudWorkspaceId;
   }
   const submit = document.getElementById('auth-submit');
   if (submit) submit.disabled = signedIn || !configured;
@@ -3038,7 +3083,7 @@ function handleClick(event) {
     updateAccountStatus();
   }
   if (id === 'auth-signout') signOutCloudAccount();
-  if (id === 'auth-sync-now') syncCloudNow().then(() => showToast('Dados sincronizados.')).catch((error) => showToast(error.message || 'Não foi possível sincronizar.', 'error'));
+  if (id === 'auth-sync-now' || id === 'manual-sync-button') synchronizeAllData();
   if (id === 'open-material-picker') openMaterialPicker();
   if (id === 'close-material-picker') closeMaterialPicker();
   if (id === 'picker-open-catalog') openMaterialCatalog();
@@ -3135,7 +3180,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-catalog-extras-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-full-sync-button-v2').catch(() => undefined);
 }
 
 initialize();
