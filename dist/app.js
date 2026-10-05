@@ -440,6 +440,31 @@ function profileValue(id) {
   return String(document.getElementById(id)?.value || '').trim();
 }
 
+function copyAccountAddressToQuote() {
+  const street = profileValue('profile-street');
+  const number = profileValue('profile-address-number');
+  const cityState = [profileValue('profile-city'), profileValue('profile-state')].filter(Boolean).join(' - ');
+  const postalDigits = profileValue('profile-postal-code').replace(/\D/g, '');
+  const postalCode = postalDigits.length === 8 ? `CEP ${postalDigits.slice(0, 5)}-${postalDigits.slice(5)}` : '';
+  const address = [
+    [street, number].filter(Boolean).join(', '),
+    profileValue('profile-address-complement'),
+    profileValue('profile-neighborhood'),
+    cityState,
+    postalCode,
+  ].filter(Boolean).join(', ').slice(0, 240);
+  if (!address) {
+    showToast('Consulte um CEP ou preencha o endereço do cadastro antes de copiar.', 'error');
+    return;
+  }
+  setValue('profile-quote-address', address);
+  state.clientQuote.businessAddress = address;
+  setValue('client-business-address', address);
+  renderClientQuotePreview();
+  persistDraftSoon();
+  showToast('Endereço copiado para o orçamento. Salve os dados da conta para reutilizá-lo nos próximos.');
+}
+
 async function lookupAddressFromPostalCode(element) {
   const digits = String(element.value || '').replace(/\D/g, '');
   if (digits.length === 8 && element.dataset.lastLookupCep === digits) return;
@@ -2810,6 +2835,7 @@ function handleClick(event) {
   if (id === 'close-layout-modal') document.getElementById('layout-modal').hidden = true;
   if (id === 'find-stores-button') openMapSearch();
   if (id === 'account-button') openAccountModal();
+  if (id === 'profile-use-account-address') copyAccountAddressToQuote();
   if (id === 'close-account-modal' || id === 'cancel-account-modal') document.getElementById('account-modal').hidden = true;
   if (id === 'auth-mode-toggle') {
     authMode = authMode === 'signup' ? 'login' : 'signup';
@@ -2853,6 +2879,10 @@ function handleClick(event) {
 function handleInput(event) {
   const element = event.target;
   if (!(element.matches('input, select, textarea'))) return;
+  if (element.id === 'profile-postal-code') {
+    if (event.type === 'input') lookupAddressFromPostalCode(element);
+    return;
+  }
   if (element.closest('#saved-material-form') && element.dataset.savedTierIndex === undefined && !['saved-material-calculation-mode', 'saved-material-basis'].includes(element.id)) return;
   if (event.type === 'input' && element instanceof HTMLInputElement && (element.dataset.materialId || element.dataset.pieceId)) {
     handleFieldEvent(element, { recalculate: false });
@@ -2861,7 +2891,6 @@ function handleInput(event) {
   }
   if (event.type === 'input' && element instanceof HTMLSelectElement) return;
   handleFieldEvent(element);
-  if (element.id === 'profile-postal-code') lookupAddressFromPostalCode(element);
 }
 
 function clearPresetTextOnFocus(event) {
@@ -2922,7 +2951,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-material-input-flow-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-cep-to-quote-v1').catch(() => undefined);
 }
 
 initialize();
