@@ -435,3 +435,5 @@ input:disabled, select:disabled { color: #8195a1; background: #edf3f6; }
 @media (max-width: 650px) {
   .topbar-actions .account-button { display: inline-flex; padding: 8px 9px; font-size: 0.67rem; }
 }
+
+.catalog-extras-panel { margin-top: 18px; }

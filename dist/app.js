@@ -74,6 +74,7 @@ const state = {
 };
 
 let savedMaterials = [];
+let savedCatalogItems = [];
 let savedMaterialVolumeTiers = [];
 let savedQuotes = [];
 let computed = emptyComputed();
@@ -681,6 +682,7 @@ function cloudPayloadMatchesLocal(recordType, local, payload) {
 async function applyCloudRecords(records) {
   let draftChanged = false;
   let materialsChanged = false;
+  let catalogChanged = false;
   let quotesChanged = false;
   for (const record of records || []) {
     const cloudTime = new Date(record.updated_at || 0).getTime() || 0;
@@ -688,6 +690,7 @@ async function applyCloudRecords(records) {
     const storeName = record.record_type === 'draft' ? 'settings' : record.record_type === 'material' ? 'materials' : 'quotes';
     const localId = record.record_type === 'draft' ? 'draft' : record.record_id;
     const local = await storeGet(storeName, localId);
+    const isCatalogItem = record.record_type === 'material' && (String(record.record_id).startsWith('catalog:') || local?.catalogCategory);
     if (record.is_deleted) {
       if (!local || (record.record_type === 'draft' && draftTimer)) continue;
       await storeDelete(storeName, localId, { fromCloud: true });
@@ -700,6 +703,10 @@ async function applyCloudRecords(records) {
         savedQuotes = savedQuotes.filter((item) => item.id !== record.record_id);
         quotesChanged = true;
       }
+      if (isCatalogItem) {
+        savedCatalogItems = savedCatalogItems.filter((item) => item.id !== record.record_id);
+        catalogChanged = true;
+      }
       continue;
     }
     const payload = record.payload;
@@ -709,6 +716,11 @@ async function applyCloudRecords(records) {
       await storePut('settings', { key: 'draft', value: payload.value, updatedAt: record.updated_at, cloudIntent: payload.cloudIntent === true }, { fromCloud: true });
       hydrateState(payload.value);
       draftChanged = true;
+    } else if (isCatalogItem && payload?.catalogCategory) {
+      const item = { ...payload, id: record.record_id, _syncUpdatedAt: record.updated_at };
+      await storePut('materials', item, { fromCloud: true });
+      savedCatalogItems = [item, ...savedCatalogItems.filter((entry) => entry.id !== record.record_id)].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+      catalogChanged = true;
     } else if (record.record_type === 'material' && payload?.id) {
       const material = { ...payload, id: record.record_id, _syncUpdatedAt: record.updated_at };
       await storePut('materials', material, { fromCloud: true });
@@ -729,8 +741,10 @@ async function applyCloudRecords(records) {
       renderSavedMaterials();
       if (!document.getElementById('material-picker-modal')?.hidden) renderMaterialPicker();
     }
+    if (catalogChanged) renderCatalogItems();
     if (quotesChanged) renderQuotes();
   }
+  if (draftChanged && catalogChanged) renderCatalogItems();
 }
 
 async function syncCloudNow() {
@@ -1196,7 +1210,9 @@ async function loadPersistence() {
       storeGetAll('quotes'),
     ]);
     if (draft?.value) hydrateState(draft.value, { inferDefaultText: !draft.value.quoteId });
-    if (materials.length) savedMaterials = materials.map(normalizeMaterial);
+    savedCatalogItems = materials.filter((item) => item.catalogCategory).sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+    savedMaterials = materials.filter((item) => !item.catalogCategory).map(normalizeMaterial);
+    renderCatalogItems();
     if (quotes.length) savedQuotes = quotes.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
   } catch (error) {
     console.warn('Não foi possível abrir o armazenamento local.', error);
@@ -1512,6 +1528,82 @@ function renderSavedMaterials() {
     `;
   }).join('');
 }
+function renderCatalogItems() {
+  const container = document.getElementById('catalog-items-list');
+  if (!container) return;
+  if (!savedCatalogItems.length) {
+    container.innerHTML = '<div class="empty-state"><strong>Nenhum item cadastrado</strong><p>Adicione acabamentos, insumos e serviços de mão de obra para manter seus preços organizados.</p></div>';
+    return;
+  }
+  const labels = { finish: 'Acabamento', supply: 'Insumo', labor: 'Mão de obra' };
+  container.innerHTML = savedCatalogItems.map((item) => `
+    <article class="saved-material-card">
+      <div><div class="saved-material-card-title">${escapeHtml(item.name)}</div><div class="saved-material-card-meta">${labels[item.catalogCategory] || 'Item'} · ${formatMoney(item.unitPrice)} / ${escapeHtml(item.unit || 'un')}</div>${item.notes ? `<div class="saved-material-card-supplier">${escapeHtml(item.notes)}</div>` : ''}</div>
+      <div class="saved-material-actions"><button class="icon-button" type="button" data-action="edit-catalog-item" data-id="${escapeHtml(item.id)}" title="Editar">✎</button><button class="icon-button" type="button" data-action="delete-catalog-item" data-id="${escapeHtml(item.id)}" title="Excluir">×</button></div>
+    </article>
+  `).join('');
+}
+
+function resetCatalogItemForm() {
+  document.getElementById('catalog-item-form')?.reset();
+  setValue('catalog-item-id', '');
+  setValue('catalog-item-category', 'finish');
+  setValue('catalog-item-unit', 'un');
+  setValue('catalog-item-price', 0);
+}
+
+function editCatalogItem(id) {
+  const item = savedCatalogItems.find((entry) => entry.id === id);
+  if (!item) return;
+  setValue('catalog-item-id', item.id);
+  setValue('catalog-item-category', item.catalogCategory);
+  setValue('catalog-item-name', item.name);
+  setValue('catalog-item-unit', item.unit || 'un');
+  setValue('catalog-item-price', item.unitPrice);
+  setValue('catalog-item-notes', item.notes || '');
+  document.getElementById('catalog-item-form')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function submitCatalogItem(event) {
+  event.preventDefault();
+  const id = document.getElementById('catalog-item-id').value || `catalog:${uid('item')}`;
+  const existing = savedCatalogItems.find((item) => item.id === id);
+  const item = {
+    id,
+    catalogCategory: document.getElementById('catalog-item-category').value,
+    name: document.getElementById('catalog-item-name').value.trim(),
+    unit: document.getElementById('catalog-item-unit').value.trim() || 'un',
+    unitPrice: positive(document.getElementById('catalog-item-price').value),
+    notes: document.getElementById('catalog-item-notes').value.trim(),
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    // Use the existing material record channel so older Supabase RPC schemas can sync catalog entries without migration.
+    await storePut('materials', item);
+    savedCatalogItems = [item, ...savedCatalogItems.filter((entry) => entry.id !== id)].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+    resetCatalogItemForm();
+    renderCatalogItems();
+    showToast('Item salvo no catálogo.');
+  } catch (error) {
+    console.error('Não foi possível salvar o item do catálogo.', error);
+    showToast('Não foi possível salvar o item.', 'error');
+  }
+}
+
+async function deleteCatalogItem(id) {
+  const item = savedCatalogItems.find((entry) => entry.id === id);
+  if (!item || !window.confirm(`Excluir “${item.name}” do catálogo?`)) return;
+  try {
+    await storeDelete('materials', id);
+    savedCatalogItems = savedCatalogItems.filter((entry) => entry.id !== id);
+    renderCatalogItems();
+    showToast('Item excluído do catálogo.');
+  } catch (error) {
+    showToast('Não foi possível excluir o item.', 'error');
+  }
+}
+
 function renderMaterialPicker() {
   const container = document.getElementById('material-picker-list');
   if (!container) return;
@@ -2311,7 +2403,10 @@ function switchView(viewId) {
   if (eyebrowElement) eyebrowElement.textContent = eyebrow;
   if (titleElement) titleElement.textContent = title;
   if (viewId === 'quotes-view') renderQuotes();
-  if (viewId === 'materials-view') renderSavedMaterials();
+  if (viewId === 'materials-view') {
+    renderSavedMaterials();
+    renderCatalogItems();
+  }
 }
 
 function renderAll({ persistDraft = true } = {}) {
@@ -2322,6 +2417,7 @@ function renderAll({ persistDraft = true } = {}) {
   renderClientQuoteForm();
   renderQuotes();
   renderSavedMaterials();
+  renderCatalogItems();
   calculateAndRender({ persistDraft });
 }
 
@@ -2629,6 +2725,7 @@ function exportBackup() {
     exportedAt: new Date().toISOString(),
     draft: clone(state),
     materials: clone(savedMaterials),
+    catalogItems: clone(savedCatalogItems),
     quotes: clone(savedQuotes),
   };
   downloadFile(`grafiflow-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(backup, null, 2));
@@ -2642,11 +2739,14 @@ async function importBackup(file) {
     if (!parsed || !['GrafiFlow', 'Nesto'].includes(parsed.app)) throw new Error('Arquivo incompatível');
     if (parsed.draft) hydrateState(parsed.draft, { inferDefaultText: !parsed.draft.quoteId });
     if (Array.isArray(parsed.materials)) savedMaterials = parsed.materials.map(normalizeMaterial);
+    if (Array.isArray(parsed.catalogItems)) savedCatalogItems = parsed.catalogItems.map((item) => ({ ...item, id: String(item.id).startsWith('catalog:') ? item.id : `catalog:${uid('item')}` }));
     if (Array.isArray(parsed.quotes)) savedQuotes = parsed.quotes;
     await storePut('settings', { key: 'draft', value: clone(state), updatedAt: new Date().toISOString(), cloudIntent: true });
     for (const material of savedMaterials) await storePut('materials', material);
+    for (const item of savedCatalogItems) await storePut('materials', item);
     for (const quote of savedQuotes) await storePut('quotes', quote);
     renderAll({ persistDraft: false });
+    renderCatalogItems();
     showToast('Backup importado com sucesso.');
   } catch (error) {
     console.error(error);
@@ -2897,6 +2997,8 @@ function handleClick(event) {
     if (action === 'use-saved-material') useSavedMaterial(id);
     if (action === 'edit-saved-material') editSavedMaterial(id);
     if (action === 'delete-saved-material') deleteSavedMaterial(id);
+    if (action === 'edit-catalog-item') editCatalogItem(id);
+    if (action === 'delete-catalog-item') deleteCatalogItem(id);
     return;
   }
   const id = event.target.closest('button')?.id;
@@ -2943,6 +3045,7 @@ function handleClick(event) {
   if (id === 'backup-button') exportBackup();
   if (id === 'install-button' || id === 'help-install-button') installApp();
   if (id === 'materials-new-button' || id === 'cancel-saved-material') resetSavedMaterialForm();
+  if (id === 'cancel-catalog-item') resetCatalogItemForm();
   if (id === 'optimize-button') {
     state.optimize = !state.optimize;
     toggleButton(event.target.closest('#optimize-button'), state.optimize);
@@ -2988,6 +3091,7 @@ function initialize() {
   document.addEventListener('input', handleInput);
   document.addEventListener('change', handleInput);
   document.getElementById('saved-material-form')?.addEventListener('submit', submitSavedMaterial);
+  document.getElementById('catalog-item-form')?.addEventListener('submit', submitCatalogItem);
   document.getElementById('account-auth-form')?.addEventListener('submit', submitCloudAuth);
   document.getElementById('recovery-request-form')?.addEventListener('submit', submitPasswordRecoveryRequest);
   document.getElementById('password-recovery-form')?.addEventListener('submit', submitRecoveredPassword);
@@ -3031,7 +3135,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-web-pwa-sync-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-catalog-extras-v1').catch(() => undefined);
 }
 
 initialize();
