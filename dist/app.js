@@ -86,7 +86,9 @@ let cloudWorkspaceId = '';
 let cloudWorkspaceName = '';
 let cloudSyncTimer;
 let cloudSyncRunning = false;
-let suppressCloudQueue = false;
+let cloudSyncRequested = false;
+let cloudSyncChannel = null;
+let cloudPollTimer = null;
 let authMode = 'login';
 let authNotice = '';
 let accountProfile = null;
@@ -265,24 +267,24 @@ async function storeGet(storeName, key) {
   return idbRequest(transaction.objectStore(storeName).get(key));
 }
 
-async function storePut(storeName, value) {
+async function storePut(storeName, value, { fromCloud = false } = {}) {
   const db = await openDatabase();
   if (!db) return;
   let storedValue = value;
-  if (!suppressCloudQueue && ['materials', 'quotes'].includes(storeName)) {
+  if (!fromCloud && ['materials', 'quotes'].includes(storeName)) {
     storedValue = { ...value, _syncUpdatedAt: new Date().toISOString() };
   }
   const transaction = db.transaction(storeName, 'readwrite');
   await idbRequest(transaction.objectStore(storeName).put(storedValue));
-  if (!suppressCloudQueue) await queueCloudMutation(storeName, storedValue).catch((error) => console.warn('Não foi possível registrar a sincronização pendente.', error));
+  if (!fromCloud) await queueCloudMutation(storeName, storedValue).catch((error) => console.warn('Não foi possível registrar a sincronização pendente.', error));
 }
 
-async function storeDelete(storeName, key) {
+async function storeDelete(storeName, key, { fromCloud = false } = {}) {
   const db = await openDatabase();
   if (!db) return;
   const transaction = db.transaction(storeName, 'readwrite');
   await idbRequest(transaction.objectStore(storeName).delete(key));
-  if (!suppressCloudQueue) await queueCloudMutation(storeName, null, { recordId: key, deleted: true }).catch((error) => console.warn('Não foi possível registrar a exclusão pendente.', error));
+  if (!fromCloud) await queueCloudMutation(storeName, null, { recordId: key, deleted: true }).catch((error) => console.warn('Não foi possível registrar a exclusão pendente.', error));
 }
 
 function cloudConfig() {
@@ -323,15 +325,16 @@ function recordIdentity(storeName, value) {
 }
 
 async function queueCloudMutation(storeName, value, { recordId = '', deleted = false } = {}) {
-  if (suppressCloudQueue || !['settings', 'materials', 'quotes'].includes(storeName)) return;
+  if (!['settings', 'materials', 'quotes'].includes(storeName)) return;
   const identity = value ? recordIdentity(storeName, value) : storeName === 'settings' ? null : { type: storeName === 'materials' ? 'material' : 'quote', id: String(recordId) };
   if (!identity) return;
   const db = await openDatabase();
   if (!db) return;
   const queueId = `${identity.type}:${identity.id}`;
-  const timestamp = value?.updatedAt || value?._syncUpdatedAt || new Date().toISOString();
   const existing = await storeGet('syncQueue', queueId);
-  if (existing && new Date(existing.updatedAt).getTime() > new Date(timestamp).getTime()) return;
+  const candidateTime = new Date(value?.updatedAt || value?._syncUpdatedAt || Date.now()).getTime() || Date.now();
+  const existingTime = new Date(existing?.updatedAt || 0).getTime() || 0;
+  const timestamp = new Date(Math.max(candidateTime, existingTime + 1)).toISOString();
   const transaction = db.transaction('syncQueue', 'readwrite');
   await idbRequest(transaction.objectStore('syncQueue').put({
     id: queueId,
@@ -342,6 +345,7 @@ async function queueCloudMutation(storeName, value, { recordId = '', deleted = f
     updatedAt: timestamp,
   }));
   scheduleCloudSync();
+  cloudSyncChannel?.postMessage({ type: 'local-change', recordType: identity.type, recordId: identity.id });
 }
 
 function hasMeaningfulDraft(draftRecord) {
@@ -588,8 +592,33 @@ function scheduleCloudSync() {
   clearTimeout(cloudSyncTimer);
   cloudSyncTimer = setTimeout(() => syncCloudNow().catch((error) => {
     console.warn('A sincronização será retomada quando houver conexão.', error);
-    updateAccountStatus('Aguardando sincronização');
+    updateAccountStatus('Sincronização pendente. Tentaremos novamente automaticamente.');
   }), 900);
+}
+
+function syncAfterWake() {
+  if (!cloudSession || !navigator.onLine || !cloudConfigured()) return;
+  if (!cloudWorkspaceId) {
+    restoreCloudAccount();
+    return;
+  }
+  syncCloudNow().catch((error) => updateAccountStatus(error.message || 'Sincronização indisponível'));
+}
+
+function initializeCrossTabSync() {
+  if ('BroadcastChannel' in window) {
+    cloudSyncChannel = new BroadcastChannel('grafiflow-cloud-sync-v1');
+    cloudSyncChannel.addEventListener('message', (event) => {
+      if (event.data?.type === 'local-change') syncAfterWake();
+    });
+  }
+  cloudPollTimer = setInterval(() => {
+    if (!document.hidden) syncAfterWake();
+  }, 20000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) syncAfterWake();
+  });
+  window.addEventListener('focus', syncAfterWake);
 }
 
 async function getWorkspaceMembership() {
@@ -635,41 +664,85 @@ async function localRecordTimestamp(recordType, recordId) {
   return Math.max(new Date(valueTime || 0).getTime() || 0, new Date(queueTime || 0).getTime() || 0);
 }
 
-async function applyCloudRecords(records) {
-  suppressCloudQueue = true;
-  let stateChanged = false;
-  try {
-    for (const record of records || []) {
-      const cloudTime = new Date(record.updated_at || 0).getTime() || 0;
-      if (await localRecordTimestamp(record.record_type, record.record_id) > cloudTime) continue;
-      const storeName = record.record_type === 'draft' ? 'settings' : record.record_type === 'material' ? 'materials' : 'quotes';
-      if (record.is_deleted) {
-        await storeDelete(storeName, record.record_type === 'draft' ? 'draft' : record.record_id);
-        if (record.record_type === 'draft') stateChanged = true;
-        continue;
-      }
-      const payload = record.payload;
-      if (record.record_type === 'draft') {
-        if (payload?.value) {
-          await storePut('settings', { key: 'draft', value: payload.value, updatedAt: record.updated_at, cloudIntent: payload.cloudIntent === true });
-          stateChanged = true;
-        }
-      } else if (record.record_type === 'material' && payload?.id) {
-        await storePut('materials', { ...payload, id: record.record_id, _syncUpdatedAt: record.updated_at });
-      } else if (record.record_type === 'quote' && payload?.id) {
-        await storePut('quotes', { ...payload, id: record.record_id, _syncUpdatedAt: record.updated_at });
-      }
-    }
-  } finally {
-    suppressCloudQueue = false;
+function cloudPayloadMatchesLocal(recordType, local, payload) {
+  if (!local || !payload) return false;
+  if (recordType === 'draft') {
+    return JSON.stringify({ value: local.value, cloudIntent: local.cloudIntent === true })
+      === JSON.stringify({ value: payload.value, cloudIntent: payload.cloudIntent === true });
   }
-  await loadPersistence();
-  if (!state.pieces.length) state.pieces.push(defaultPiece(state.materials[0]?.id));
-  if (stateChanged || records?.length) renderAll({ persistDraft: false });
+  const stripSyncMetadata = (value) => {
+    const copy = clone(value);
+    delete copy._syncUpdatedAt;
+    return JSON.stringify(copy);
+  };
+  return stripSyncMetadata(local) === stripSyncMetadata(payload);
+}
+
+async function applyCloudRecords(records) {
+  let draftChanged = false;
+  let materialsChanged = false;
+  let quotesChanged = false;
+  for (const record of records || []) {
+    const cloudTime = new Date(record.updated_at || 0).getTime() || 0;
+    if (await localRecordTimestamp(record.record_type, record.record_id) > cloudTime) continue;
+    const storeName = record.record_type === 'draft' ? 'settings' : record.record_type === 'material' ? 'materials' : 'quotes';
+    const localId = record.record_type === 'draft' ? 'draft' : record.record_id;
+    const local = await storeGet(storeName, localId);
+    if (record.is_deleted) {
+      if (!local || (record.record_type === 'draft' && draftTimer)) continue;
+      await storeDelete(storeName, localId, { fromCloud: true });
+      if (record.record_type === 'draft') draftChanged = true;
+      if (record.record_type === 'material') {
+        savedMaterials = savedMaterials.filter((item) => item.id !== record.record_id);
+        materialsChanged = true;
+      }
+      if (record.record_type === 'quote') {
+        savedQuotes = savedQuotes.filter((item) => item.id !== record.record_id);
+        quotesChanged = true;
+      }
+      continue;
+    }
+    const payload = record.payload;
+    if (cloudPayloadMatchesLocal(record.record_type, local, payload)) continue;
+    if (record.record_type === 'draft') {
+      if (!payload?.value || draftTimer) continue;
+      await storePut('settings', { key: 'draft', value: payload.value, updatedAt: record.updated_at, cloudIntent: payload.cloudIntent === true }, { fromCloud: true });
+      hydrateState(payload.value);
+      draftChanged = true;
+    } else if (record.record_type === 'material' && payload?.id) {
+      const material = { ...payload, id: record.record_id, _syncUpdatedAt: record.updated_at };
+      await storePut('materials', material, { fromCloud: true });
+      savedMaterials = [normalizeMaterial(material), ...savedMaterials.filter((item) => item.id !== record.record_id)];
+      materialsChanged = true;
+    } else if (record.record_type === 'quote' && payload?.id) {
+      const quote = { ...payload, id: record.record_id, _syncUpdatedAt: record.updated_at };
+      await storePut('quotes', quote, { fromCloud: true });
+      savedQuotes = [quote, ...savedQuotes.filter((item) => item.id !== record.record_id)].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+      quotesChanged = true;
+    }
+  }
+  if (draftChanged) {
+    if (!state.pieces.length) state.pieces.push(defaultPiece(state.materials[0]?.id));
+    renderAll({ persistDraft: false });
+  } else {
+    if (materialsChanged) {
+      renderSavedMaterials();
+      if (!document.getElementById('material-picker-modal')?.hidden) renderMaterialPicker();
+    }
+    if (quotesChanged) renderQuotes();
+  }
 }
 
 async function syncCloudNow() {
-  if (!cloudSession || !cloudWorkspaceId || !navigator.onLine || !cloudConfigured() || cloudSyncRunning) return;
+  if (!cloudSession || !navigator.onLine || !cloudConfigured()) return;
+  if (!cloudWorkspaceId) {
+    restoreCloudAccount();
+    return;
+  }
+  if (cloudSyncRunning) {
+    cloudSyncRequested = true;
+    return;
+  }
   cloudSyncRunning = true;
   let syncSucceeded = false;
   updateAccountStatus('Sincronizando…');
@@ -716,11 +789,16 @@ async function syncCloudNow() {
     await applyCloudRecords(records);
     syncSucceeded = true;
     updateAccountStatus('Sincronizado');
+  } catch (error) {
+    updateAccountStatus(error?.message || 'Falha na sincronização. Tentaremos novamente.');
+    throw error;
   } finally {
     cloudSyncRunning = false;
-    updateAccountStatus();
     const pending = await storeGetAll('syncQueue').catch(() => []);
-    if (syncSucceeded && pending.length) scheduleCloudSync();
+    const requested = cloudSyncRequested;
+    cloudSyncRequested = false;
+    if (syncSucceeded) updateAccountStatus('Sincronizado');
+    if (syncSucceeded && (pending.length || requested)) scheduleCloudSync();
   }
 }
 
@@ -1215,6 +1293,7 @@ function normalizeSupply(supply) {
 function persistDraftSoon() {
   clearTimeout(draftTimer);
   draftTimer = setTimeout(async () => {
+    draftTimer = null;
     try {
       await storePut('settings', { key: 'draft', value: clone(state), updatedAt: new Date().toISOString(), cloudIntent: true });
     } catch (error) {
@@ -2903,6 +2982,7 @@ function clearPresetTextOnFocus(event) {
 }
 
 function initialize() {
+  initializeCrossTabSync();
   document.addEventListener('click', handleClick);
   document.addEventListener('focusin', clearPresetTextOnFocus);
   document.addEventListener('input', handleInput);
@@ -2932,7 +3012,7 @@ function initialize() {
   });
   window.addEventListener('online', updateConnectionStatus);
   window.addEventListener('offline', updateConnectionStatus);
-  window.addEventListener('online', () => restoreCloudAccount());
+  window.addEventListener('online', syncAfterWake);
   window.addEventListener('beforeinstallprompt', (event) => {
     event.preventDefault();
     deferredInstallPrompt = event;
@@ -2951,7 +3031,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-cep-to-quote-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261004-web-pwa-sync-v1').catch(() => undefined);
 }
 
 initialize();
