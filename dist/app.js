@@ -4,6 +4,29 @@ const DB_VERSION = 2;
 const CLOUD_SESSION_KEY = 'grafiflow.auth.v1';
 const CLOUD_WORKSPACE_KEY = 'grafiflow.workspace.v1';
 const CLOUD_OWNER_KEY = 'grafiflow.local.owner.v1';
+const SYNC_CURSOR_KEY = 'grafiflow.sync.cursor.v1';
+const MAX_ROLL_LENGTH_MM = 50000;
+const MAX_LAYOUT_PIECES_PER_MATERIAL = 1000;
+const CATALOG_RECORD_TYPES = Object.freeze({
+  finish: 'catalog_finish',
+  supply: 'catalog_supply',
+  labor: 'catalog_labor',
+  extra: 'catalog_extra',
+});
+const CATALOG_CATEGORY_LABELS = Object.freeze({
+  finish: 'Acabamento',
+  supply: 'Insumo',
+  labor: 'Mão de obra',
+  extra: 'Extra',
+});
+const CATALOG_BASIS_LABELS = Object.freeze({
+  unit: 'unidade',
+  linear: 'metro linear',
+  m2: 'm²',
+  sheet: 'chapa',
+  hour: 'hora',
+  fixed: 'valor fixo',
+});
 const MATERIAL_COLORS = ['#0a97e0', '#35bdc4', '#072d54', '#f5c51d', '#e52b7a', '#3d82b5', '#0f9f8a', '#6a78d4'];
 const PIECE_COLORS = ['#0a97e0', '#e52b7a', '#0f9f8a', '#f59e0b', '#6a78d4', '#d946ef', '#16a6a1', '#ef4444', '#3d82b5', '#84a21b', '#a855f7', '#ea580c', '#0891b2', '#be123c', '#4f46e5', '#65a30d'];
 
@@ -85,6 +108,8 @@ let deferredInstallPrompt = null;
 let cloudSession = null;
 let cloudWorkspaceId = '';
 let cloudWorkspaceName = '';
+let cloudIncrementalSyncAvailable = null;
+let cloudSyncCapabilityCheckedAt = 0;
 let cloudSyncTimer;
 let cloudSyncRunning = false;
 let cloudSyncRequested = false;
@@ -129,6 +154,7 @@ function emptyComputed() {
     markup: 0,
     suggestedPrice: 0,
     warnings: [],
+    blockingErrors: [],
   };
 }
 
@@ -295,7 +321,12 @@ async function storeDelete(storeName, key, { fromCloud = false } = {}) {
   const existing = fromCloud ? null : await storeGet(storeName, key);
   const transaction = db.transaction(storeName, 'readwrite');
   await idbRequest(transaction.objectStore(storeName).delete(key));
-  if (!fromCloud) await queueCloudMutation(storeName, null, { recordId: key, deleted: true, baseUpdatedAt: existing?._cloudVersionAt || null }).catch((error) => console.warn('Não foi possível registrar a exclusão pendente.', error));
+  if (!fromCloud) await queueCloudMutation(storeName, null, {
+    recordId: key,
+    recordType: recordIdentity(storeName, existing || { id: key })?.type,
+    deleted: true,
+    baseUpdatedAt: existing?._cloudVersionAt || null,
+  }).catch((error) => console.warn('Não foi possível registrar a exclusão pendente.', error));
 }
 
 function cloudConfig() {
@@ -328,16 +359,35 @@ function saveCloudSession(session) {
   updateAccountStatus();
 }
 
+function catalogRecordType(category) {
+  return CATALOG_RECORD_TYPES[category] || '';
+}
+
+function catalogCategoryFromRecordType(recordType) {
+  return Object.keys(CATALOG_RECORD_TYPES).find((category) => CATALOG_RECORD_TYPES[category] === recordType) || '';
+}
+
+function catalogCategoryForRecord(record) {
+  return record?.payload?.catalogCategory || catalogCategoryFromRecordType(record?.record_type || record?.recordType) || '';
+}
+
+function isCatalogRecord(recordType, payload = null) {
+  return Boolean(catalogCategoryFromRecordType(recordType) || payload?.catalogCategory);
+}
+
 function recordIdentity(storeName, value) {
   if (storeName === 'settings' && value?.key === 'draft') return { type: 'draft', id: 'draft' };
-  if (storeName === 'materials' && value?.id) return { type: 'material', id: String(value.id) };
+  if (storeName === 'materials' && value?.id) return { type: catalogRecordType(value.catalogCategory) || 'material', id: String(value.id) };
   if (storeName === 'quotes' && value?.id) return { type: 'quote', id: String(value.id) };
   return null;
 }
 
-async function queueCloudMutation(storeName, value, { recordId = '', deleted = false, baseUpdatedAt = null } = {}) {
+async function queueCloudMutation(storeName, value, { recordId = '', recordType = '', deleted = false, baseUpdatedAt = null } = {}) {
   if (!['settings', 'materials', 'quotes'].includes(storeName)) return;
-  const identity = value ? recordIdentity(storeName, value) : storeName === 'settings' ? null : { type: storeName === 'materials' ? 'material' : 'quote', id: String(recordId) };
+  const inferredType = storeName === 'materials' ? 'material' : 'quote';
+  const identity = value
+    ? recordIdentity(storeName, value)
+    : storeName === 'settings' ? null : { type: recordType || inferredType, id: String(recordId) };
   if (!identity) return;
   const db = await openDatabase();
   if (!db) return;
@@ -435,6 +485,7 @@ async function cloudFetch(path, { method = 'GET', body, token = cloudSession?.ac
   if (!response.ok) {
     const error = new Error(result?.msg || result?.message || result?.error_description || result?.error || `Supabase respondeu ${response.status}.`);
     error.status = response.status;
+    error.code = result?.code || '';
     throw error;
   }
   return result;
@@ -715,8 +766,15 @@ async function localRecordTimestamp(recordType, recordId) {
   if (queued) return Number.MAX_SAFE_INTEGER;
   let value;
   if (recordType === 'draft') value = await storeGet('settings', 'draft');
-  if (recordType === 'material') value = await storeGet('materials', recordId);
+  if (recordType === 'material' || catalogCategoryFromRecordType(recordType)) value = await storeGet('materials', recordId);
   if (recordType === 'quote') value = await storeGet('quotes', recordId);
+  if (recordType === 'material' && (value?.catalogCategory || String(recordId).startsWith('catalog:'))) {
+    const category = value?.catalogCategory;
+    const categoryTypes = category ? [catalogRecordType(category)] : Object.values(CATALOG_RECORD_TYPES);
+    for (const typedRecordType of categoryTypes) {
+      if (typedRecordType && await storeGet('syncQueue', `${typedRecordType}:${recordId}`)) return Number.MAX_SAFE_INTEGER;
+    }
+  }
   if (recordType === 'draft' && !shouldSyncDraft(value)) return 0;
   const cloudTime = value?._cloudVersionAt || '';
   return new Date(cloudTime || 0).getTime() || 0;
@@ -791,9 +849,9 @@ async function preserveRejectedCloudMutation(item) {
     renderQuotes();
     return true;
   }
-  if (item.recordType === 'material' && item.payload.id) {
+  if ((item.recordType === 'material' || catalogCategoryFromRecordType(item.recordType)) && item.payload.id) {
     const original = item.payload;
-    const isCatalogItem = Boolean(original.catalogCategory) || String(item.recordId).startsWith('catalog:');
+    const isCatalogItem = isCatalogRecord(item.recordType, original) || String(item.recordId).startsWith('catalog:');
     const id = isCatalogItem ? `catalog:${uid('conflict')}` : uid('material-conflict');
     const copy = { ...clone(original), id, name: `Cópia de conflito — ${original.name || 'Material'}`, updatedAt: now, isConflictCopy: true };
     await storePut('materials', copy);
@@ -817,11 +875,15 @@ async function applyCloudRecords(records) {
   for (const record of records || []) {
     const cloudTime = new Date(record.updated_at || 0).getTime() || 0;
     if (await localRecordTimestamp(record.record_type, record.record_id) > cloudTime) continue;
-    const storeName = record.record_type === 'draft' ? 'settings' : record.record_type === 'material' ? 'materials' : 'quotes';
+    const isCatalogType = Boolean(catalogCategoryFromRecordType(record.record_type));
+    const storeName = record.record_type === 'draft' ? 'settings' : (record.record_type === 'material' || isCatalogType) ? 'materials' : 'quotes';
     const localId = record.record_type === 'draft' ? 'draft' : record.record_id;
     const local = await storeGet(storeName, localId);
-    const isCatalogItem = record.record_type === 'material' && (String(record.record_id).startsWith('catalog:') || local?.catalogCategory);
+    const catalogCategory = catalogCategoryForRecord(record) || local?.catalogCategory || '';
+    const isLegacyCatalogType = record.record_type === 'material' && (String(record.record_id).startsWith('catalog:') || Boolean(catalogCategory));
+    const isCatalogItem = isCatalogType || isLegacyCatalogType;
     if (record.is_deleted) {
+      if (record.record_type === 'material' && cloudIncrementalSyncAvailable && local?.catalogCategory) continue;
       if (!local || (record.record_type === 'draft' && draftTimer)) continue;
       await storeDelete(storeName, localId, { fromCloud: true });
       if (record.record_type === 'draft') draftChanged = true;
@@ -851,11 +913,15 @@ async function applyCloudRecords(records) {
       await storePut('settings', { key: 'draft', value: payload.value, updatedAt: record.updated_at, cloudIntent: payload.cloudIntent === true, _cloudVersionAt: record.updated_at }, { fromCloud: true });
       hydrateState(payload.value);
       draftChanged = true;
-    } else if (isCatalogItem && payload?.catalogCategory) {
-      const item = { ...payload, id: record.record_id, _syncUpdatedAt: record.updated_at, _cloudVersionAt: record.updated_at };
+    } else if (isCatalogItem && (payload?.catalogCategory || catalogCategory)) {
+      const category = payload?.catalogCategory || catalogCategory;
+      const item = { ...payload, catalogCategory: category, id: record.record_id, _syncUpdatedAt: record.updated_at, _cloudVersionAt: record.updated_at };
       await storePut('materials', item, { fromCloud: true });
       savedCatalogItems = [item, ...savedCatalogItems.filter((entry) => entry.id !== record.record_id)].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
       catalogChanged = true;
+      if (record.record_type === 'material' && cloudIncrementalSyncAvailable) {
+        await queueCloudMutation('materials', item);
+      }
     } else if (record.record_type === 'material' && payload?.id) {
       const material = { ...payload, id: record.record_id, _syncUpdatedAt: record.updated_at, _cloudVersionAt: record.updated_at };
       await storePut('materials', material, { fromCloud: true });
@@ -882,6 +948,105 @@ async function applyCloudRecords(records) {
   if (draftChanged && catalogChanged) renderCatalogItems();
 }
 
+async function cloudSyncCursor() {
+  if (!cloudWorkspaceId) return 0;
+  const record = await storeGet('settings', `${SYNC_CURSOR_KEY}:${cloudWorkspaceId}`);
+  const value = Number(record?.value || 0);
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+async function saveCloudSyncCursor(value) {
+  if (!cloudWorkspaceId || !Number.isSafeInteger(value) || value < 0) return;
+  await storePut('settings', { key: `${SYNC_CURSOR_KEY}:${cloudWorkspaceId}`, value }, { fromCloud: true });
+}
+
+function isMissingIncrementalSyncRpc(error) {
+  return error?.status === 404 && (
+    error.code === 'PGRST202'
+    || /list_grafiflow_records/i.test(error.message || '')
+  );
+}
+
+async function detectIncrementalSyncSupport(session) {
+  if (cloudIncrementalSyncAvailable !== null && Date.now() - cloudSyncCapabilityCheckedAt < 10000) {
+    return cloudIncrementalSyncAvailable;
+  }
+  try {
+    await cloudFetch('/rest/v1/rpc/list_grafiflow_records', {
+      method: 'POST',
+      token: session.access_token,
+      body: { target_workspace_id: cloudWorkspaceId, after_change_seq: await cloudSyncCursor(), page_size: 1 },
+    });
+    cloudIncrementalSyncAvailable = true;
+  } catch (error) {
+    if (!isMissingIncrementalSyncRpc(error)) throw error;
+    cloudIncrementalSyncAvailable = false;
+  }
+  cloudSyncCapabilityCheckedAt = Date.now();
+  return cloudIncrementalSyncAvailable;
+}
+
+function serverRecordTypeForMutation(item, supportsTypedCatalog) {
+  const itemType = item.recordType;
+  if (!supportsTypedCatalog) return catalogCategoryFromRecordType(itemType) ? 'material' : itemType;
+  if (itemType === 'material' && item.payload?.catalogCategory) return catalogRecordType(item.payload.catalogCategory) || itemType;
+  return itemType;
+}
+
+async function normalizeLegacyCatalogQueue() {
+  const queued = await storeGetAll('syncQueue');
+  for (const item of queued) {
+    if (item.recordType !== 'material' || !item.payload?.catalogCategory) continue;
+    const local = await storeGet('materials', item.recordId);
+    const typedRecordType = catalogRecordType(local?.catalogCategory || item.payload.catalogCategory);
+    if (!typedRecordType) continue;
+    if (local?.catalogCategory) {
+      await queueCloudMutation('materials', local);
+    } else {
+      await queueCloudMutation('materials', null, {
+        recordId: item.recordId,
+        recordType: typedRecordType,
+        deleted: true,
+        baseUpdatedAt: item.baseUpdatedAt || null,
+      });
+    }
+    await deleteQueuedMutation(item.id);
+  }
+}
+
+async function downloadFullCloudSnapshot(session) {
+  const records = [];
+  let offset = 0;
+  while (true) {
+    const page = await cloudFetch(`/rest/v1/grafiflow_records?select=workspace_id,record_type,record_id,payload,is_deleted,updated_at&workspace_id=eq.${encodeURIComponent(cloudWorkspaceId)}&order=record_type.asc,record_id.asc&limit=500&offset=${offset}`, { token: session.access_token });
+    if (!Array.isArray(page)) throw new Error('O Supabase não retornou a lista de registros.');
+    if (!page.length) break;
+    records.push(...page);
+    if (page.length < 500) break;
+    offset += page.length;
+  }
+  await applyCloudRecords(records);
+}
+
+async function downloadIncrementalCloudChanges(session) {
+  let cursor = await cloudSyncCursor();
+  while (true) {
+    const page = await cloudFetch('/rest/v1/rpc/list_grafiflow_records', {
+      method: 'POST',
+      token: session.access_token,
+      body: { target_workspace_id: cloudWorkspaceId, after_change_seq: cursor, page_size: 500 },
+    });
+    if (!Array.isArray(page)) throw new Error('O Supabase não retornou uma página válida de alterações.');
+    if (!page.length) break;
+    await applyCloudRecords(page);
+    const nextCursor = page.reduce((maximum, record) => Math.max(maximum, Number(record.change_seq) || 0), cursor);
+    if (nextCursor <= cursor) throw new Error('A sincronização incremental recebeu um cursor inválido; nenhuma alteração foi descartada.');
+    cursor = nextCursor;
+    await saveCloudSyncCursor(cursor);
+    if (page.length < 500) break;
+  }
+}
+
 async function syncCloudNow() {
   if (!cloudSession || !navigator.onLine || !cloudConfigured()) return;
   if (!cloudWorkspaceId) {
@@ -897,6 +1062,8 @@ async function syncCloudNow() {
   updateAccountStatus('Sincronizando…');
   try {
     const session = await usableCloudSession();
+    const supportsTypedCatalog = await detectIncrementalSyncSupport(session);
+    await normalizeLegacyCatalogQueue();
     const queuedItems = await storeGetAll('syncQueue');
     const queue = [];
     for (const item of queuedItems) {
@@ -907,7 +1074,7 @@ async function syncCloudNow() {
       }
     }
     const changes = queue.map((item) => ({
-      record_type: item.recordType,
+      record_type: serverRecordTypeForMutation(item, supportsTypedCatalog),
       record_id: item.recordId,
       payload: item.deleted ? null : item.payload,
       is_deleted: item.deleted,
@@ -925,7 +1092,8 @@ async function syncCloudNow() {
       if (!Array.isArray(syncedRows)) throw new Error('O Supabase não confirmou as alterações enviadas. A fila local foi preservada.');
       const rowsByKey = new Map(syncedRows.map((row) => [`${row.record_type}:${row.record_id}`, row]));
       for (const item of batch) {
-        const remote = rowsByKey.get(`${item.recordType}:${item.recordId}`);
+        const serverRecordType = serverRecordTypeForMutation(item, supportsTypedCatalog);
+        const remote = rowsByKey.get(`${serverRecordType}:${item.recordId}`);
         if (!remote) throw new Error('O Supabase não confirmou um registro enviado. A fila local foi preservada.');
         const rejected = item.deleted
           ? !remote.is_deleted
@@ -949,16 +1117,8 @@ async function syncCloudNow() {
       if (!completedQueueIds.has(item.id)) continue;
       if (await preserveRejectedCloudMutation(item)) preservedConflicts += 1;
     }
-    const records = [];
-    let offset = 0;
-    while (true) {
-      const page = await cloudFetch(`/rest/v1/grafiflow_records?select=workspace_id,record_type,record_id,payload,is_deleted,updated_at&workspace_id=eq.${encodeURIComponent(cloudWorkspaceId)}&order=record_type.asc,record_id.asc&limit=500&offset=${offset}`, { token: session.access_token });
-      if (!Array.isArray(page) || !page.length) break;
-      records.push(...page);
-      if (page.length < 500) break;
-      offset += page.length;
-    }
-    await applyCloudRecords(records);
+    if (supportsTypedCatalog) await downloadIncrementalCloudChanges(session);
+    else await downloadFullCloudSnapshot(session);
     if (preservedConflicts) {
       showToast(`${preservedConflicts} versão(ões) local(is) conflitante(s) foi(foram) guardada(s) como cópia. Confira o histórico e o catálogo.`, 'error');
     }
@@ -1699,24 +1859,70 @@ function renderCatalogItems() {
   const container = document.getElementById('catalog-items-list');
   if (!container) return;
   if (!savedCatalogItems.length) {
-    container.innerHTML = '<div class="empty-state"><strong>Nenhum item cadastrado</strong><p>Adicione acabamentos, insumos e serviços de mão de obra para manter seus preços organizados.</p></div>';
+    container.innerHTML = '<div class="empty-state"><strong>Nenhum item cadastrado</strong><p>Organize acabamentos, insumos, mão de obra e extras com a base de cobrança de cada item.</p></div>';
     return;
   }
-  const labels = { finish: 'Acabamento', supply: 'Insumo', labor: 'Mão de obra' };
-  container.innerHTML = savedCatalogItems.map((item) => `
-    <article class="saved-material-card">
-      <div><div class="saved-material-card-title">${escapeHtml(item.name)}</div><div class="saved-material-card-meta">${labels[item.catalogCategory] || 'Item'} · ${formatMoney(item.unitPrice)} / ${escapeHtml(item.unit || 'un')}</div>${item.notes ? `<div class="saved-material-card-supplier">${escapeHtml(item.notes)}</div>` : ''}</div>
-      <div class="saved-material-actions"><button class="icon-button" type="button" data-action="edit-catalog-item" data-id="${escapeHtml(item.id)}" title="Editar">✎</button><button class="icon-button" type="button" data-action="delete-catalog-item" data-id="${escapeHtml(item.id)}" title="Excluir">×</button></div>
-    </article>
-  `).join('');
+  const categories = ['finish', 'supply', 'labor', 'extra'];
+  const groups = categories.map((category) => {
+    const items = savedCatalogItems.filter((item) => item.catalogCategory === category);
+    if (!items.length) return '';
+    const cards = items.map((item) => {
+      const basis = catalogPricingBasis(item);
+      const charge = basis === 'fixed' ? 'valor fixo' : `por ${basis === 'unit' ? catalogPricingUnit(item, basis) : CATALOG_BASIS_LABELS[basis]}`;
+      return `
+        <article class="saved-material-card">
+          <div><div class="saved-material-card-title">${escapeHtml(item.name)}</div><div class="saved-material-card-meta">${formatMoney(item.unitPrice)} · ${charge}</div>${item.notes ? `<div class="saved-material-card-supplier">${escapeHtml(item.notes)}</div>` : ''}</div>
+          <div class="saved-material-actions"><button class="icon-button" type="button" data-action="edit-catalog-item" data-id="${escapeHtml(item.id)}" title="Editar">✎</button><button class="icon-button" type="button" data-action="delete-catalog-item" data-id="${escapeHtml(item.id)}" title="Excluir">×</button></div>
+        </article>
+      `;
+    }).join('');
+    return `<section class="catalog-category-group"><h4 class="catalog-category-title">${CATALOG_CATEGORY_LABELS[category]}</h4><div class="saved-materials-list">${cards}</div></section>`;
+  });
+  container.innerHTML = `<div class="catalog-category-groups">${groups.join('')}</div>`;
+}
+
+function catalogPricingBasis(item) {
+  if (Object.prototype.hasOwnProperty.call(CATALOG_BASIS_LABELS, item?.pricingBasis)) return item.pricingBasis;
+  const unit = String(item?.unit || '').trim().toLocaleLowerCase('pt-BR');
+  if (['m2', 'm²', 'metro quadrado', 'metros quadrados'].includes(unit)) return 'm2';
+  if (['m', 'mt', 'm linear', 'metro', 'metro linear', 'metros lineares'].includes(unit)) return 'linear';
+  if (['chapa', 'chapas'].includes(unit)) return 'sheet';
+  if (['hora', 'horas', 'h'].includes(unit)) return 'hour';
+  if (['fixo', 'valor fixo'].includes(unit)) return 'fixed';
+  return 'unit';
+}
+
+function catalogPricingUnit(item, basis = catalogPricingBasis(item)) {
+  const canonical = { linear: 'm', m2: 'm²', sheet: 'chapa', hour: 'hora', fixed: 'fixo' };
+  return canonical[basis] || String(item?.unit || 'un');
+}
+
+function updateCatalogPricingControls() {
+  const basis = document.getElementById('catalog-item-basis')?.value || 'unit';
+  const unit = document.getElementById('catalog-item-unit');
+  const unitField = unit?.closest('label');
+  if (!unit) return;
+  const units = { linear: 'm', m2: 'm²', sheet: 'chapa', hour: 'hora', fixed: 'fixo' };
+  if (basis === 'unit') {
+    unit.disabled = false;
+    unit.placeholder = 'un, peça, kit';
+    if (!unit.value || unit.value === 'fixo' || ['m', 'm²', 'chapa', 'hora'].includes(unit.value)) unit.value = 'un';
+    if (unitField) unitField.hidden = false;
+  } else {
+    unit.value = units[basis] || 'un';
+    unit.disabled = true;
+    if (unitField) unitField.hidden = basis === 'fixed';
+  }
 }
 
 function resetCatalogItemForm() {
   document.getElementById('catalog-item-form')?.reset();
   setValue('catalog-item-id', '');
   setValue('catalog-item-category', 'finish');
+  setValue('catalog-item-basis', 'unit');
   setValue('catalog-item-unit', 'un');
   setValue('catalog-item-price', 0);
+  updateCatalogPricingControls();
 }
 
 function editCatalogItem(id) {
@@ -1724,10 +1930,12 @@ function editCatalogItem(id) {
   if (!item) return;
   setValue('catalog-item-id', item.id);
   setValue('catalog-item-category', item.catalogCategory);
+  setValue('catalog-item-basis', catalogPricingBasis(item));
   setValue('catalog-item-name', item.name);
   setValue('catalog-item-unit', item.unit || 'un');
   setValue('catalog-item-price', item.unitPrice);
   setValue('catalog-item-notes', item.notes || '');
+  updateCatalogPricingControls();
   document.getElementById('catalog-item-form')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
@@ -1738,15 +1946,15 @@ async function submitCatalogItem(event) {
   const item = {
     id,
     catalogCategory: document.getElementById('catalog-item-category').value,
+    pricingBasis: document.getElementById('catalog-item-basis').value,
     name: document.getElementById('catalog-item-name').value.trim(),
-    unit: document.getElementById('catalog-item-unit').value.trim() || 'un',
+    unit: document.getElementById('catalog-item-basis').value === 'unit' ? (document.getElementById('catalog-item-unit').value.trim() || 'un') : catalogPricingUnit({ pricingBasis: document.getElementById('catalog-item-basis').value }),
     unitPrice: positive(document.getElementById('catalog-item-price').value),
     notes: document.getElementById('catalog-item-notes').value.trim(),
     createdAt: existing?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   try {
-    // Use the existing material record channel so older Supabase RPC schemas can sync catalog entries without migration.
     await storePut('materials', item);
     savedCatalogItems = [item, ...savedCatalogItems.filter((entry) => entry.id !== id)].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
     resetCatalogItemForm();
@@ -1841,6 +2049,7 @@ function renderMetrics() {
   if (resultCaption) resultCaption.textContent = allSheetOnly ? 'Chapas necessárias para produzir as peças' : areaAsMainMeasure ? 'Área total consumida pelos materiais' : areaModeOnly ? 'Área total para impressão terceirizada' : computed.laminationResults.length ? 'Comprimento necessário das bobinas base' : 'Comprimento necessário de bobina';
   const metrics = document.getElementById('metrics-grid');
   if (!metrics) return;
+  if (resultState) resultState.title = computed.warnings.join('\n');
   const laminationMetric = computed.laminationAreaM2 > 0 ? `<div class="metric"><span class="metric-label">Área de laminação</span><strong class="metric-value">${formatNumber(computed.laminationAreaM2, 2)} m²</strong></div>` : '';
   const laminationLengthMetric = computed.laminationResults.some((result) => result.calculationMode === 'roll') ? `<div class="metric"><span class="metric-label">Comprimento da laminação</span><strong class="metric-value">${formatNumber(computed.laminationLengthM, 2)} m</strong></div>` : '';
   const laminationSheetsMetric = computed.laminationSheets > 0 ? `<div class="metric"><span class="metric-label">Chapas de laminação</span><strong class="metric-value">${computed.laminationSheets}</strong></div>` : '';
@@ -1866,13 +2075,20 @@ function renderCostBreakdown() {
     const quantityDecimals = result.sheetOnly && unit === 'm²' ? 3 : 2;
     return `${formatNumber(quantity, quantityDecimals)} ${displayUnit} · ${formatMoney(unitPrice)}/${unit}${tier}`;
   };
-  const materialLines = computed.materialResults.map((result) => `<div class="cost-line"><span>${escapeHtml(result.material.name)} <small>${pricingSummary(result)}</small></span><strong>${formatMoney(result.cost)}</strong></div>`).join('');
-  const laminationLines = computed.laminationResults.map((result) => `<div class="cost-line lamination-line"><span>↳ Laminação: ${escapeHtml(result.material.name)} <small>${escapeHtml(result.baseMaterial.name)} · ${pricingSummary(result)}</small></span><strong>${formatMoney(result.cost)}</strong></div>`).join('');
-  const suppliesLine = computed.suppliesCost > 0 ? `<div class="cost-line"><span>Insumos de instalação</span><strong>${formatMoney(computed.suppliesCost)}</strong></div>` : '';
-  const installationLine = computed.installationLaborCost > 0 ? `<div class="cost-line"><span>Mão de obra de instalação</span><strong>${formatMoney(computed.installationLaborCost)}</strong></div>` : '';
-  const travelLine = computed.travelCost > 0 ? `<div class="cost-line"><span>Deslocamento</span><strong>${formatMoney(computed.travelCost)}</strong></div>` : '';
-  const otherLine = computed.otherCosts > 0 ? `<div class="cost-line"><span>Outros custos</span><strong>${formatMoney(computed.otherCosts)}</strong></div>` : '';
-  container.innerHTML = `${materialLines || '<div class="cost-line"><span>Materiais</span><strong>R$ 0,00</strong></div>'}${laminationLines}${installationLine}${suppliesLine}${travelLine}${otherLine}<div class="cost-line total"><span>Custo total</span><strong>${formatMoney(computed.totalCost)}</strong></div>`;
+  const group = (title, lines) => lines ? `<section class="cost-group"><h4>${title}</h4>${lines}</section>` : '';
+  const materialLines = computed.materialResults.map((result) => `<div class="cost-line"><span>${escapeHtml(result.material.name)} <small>Material base · ${pricingSummary(result)}</small></span><strong>${formatMoney(result.cost)}</strong></div>`).join('');
+  const laminationLines = computed.laminationResults.map((result) => `<div class="cost-line lamination-line"><span>${escapeHtml(result.material.name)} <small>Acabamento / laminação · ${escapeHtml(result.baseMaterial.name)} · ${pricingSummary(result)}</small></span><strong>${formatMoney(result.cost)}</strong></div>`).join('');
+  const suppliesLines = state.installation.supplies.map((supply) => {
+    const amount = positive(supply.quantity) * positive(supply.unitPrice);
+    return amount > 0 ? `<div class="cost-line"><span>${escapeHtml(supply.description || 'Insumo')} <small>Insumo · ${formatNumber(supply.quantity, 2)} ${escapeHtml(supply.unit || 'un')} × ${formatMoney(supply.unitPrice)}</small></span><strong>${formatMoney(amount)}</strong></div>` : '';
+  }).join('');
+  const installationBasisLabels = { m2: 'm²', linear: 'metro linear', fixed: 'valor fixo' };
+  const installationMeasure = state.installation.basis === 'fixed' ? 'serviço' : installationBasisLabels[state.installation.basis] || 'm²';
+  const installationLine = computed.installationLaborCost > 0 ? `<div class="cost-line"><span>Instalação <small>Mão de obra · ${state.installation.basis === 'fixed' ? '1 serviço' : `${formatNumber(computed.installationQuantity, 2)} ${installationMeasure}`} × ${formatMoney(state.installation.unitPrice)} / ${installationMeasure}</small></span><strong>${formatMoney(computed.installationLaborCost)}</strong></div>` : '';
+  const travelLine = computed.travelCost > 0 ? `<div class="cost-line"><span>Deslocamento <small>Extra · valor fixo</small></span><strong>${formatMoney(computed.travelCost)}</strong></div>` : '';
+  const otherLine = computed.otherCosts > 0 ? `<div class="cost-line"><span>Outros extras <small>Valor fixo</small></span><strong>${formatMoney(computed.otherCosts)}</strong></div>` : '';
+  const fallbackMaterial = materialLines ? '' : '<div class="cost-line"><span>Sem material base calculado</span><strong>R$ 0,00</strong></div>';
+  container.innerHTML = `${group('Materiais base', materialLines || fallbackMaterial)}${group('Acabamentos', laminationLines)}${group('Mão de obra', installationLine)}${group('Insumos', suppliesLines)}${group('Extras', `${travelLine}${otherLine}` || '')}<div class="cost-line total"><span>Custo total</span><strong>${formatMoney(computed.totalCost)}</strong></div>`;
 }
 
 function renderProfit() {
@@ -1960,6 +2176,10 @@ function closeClientQuoteModal() {
 }
 
 function printClientQuote() {
+  if (computed.blockingErrors.length) {
+    showToast(computed.blockingErrors[0], 'error');
+    return;
+  }
   renderClientQuotePreview();
   const preview = document.querySelector('#client-quote-preview .client-quote-document');
   if (!preview) {
@@ -2071,15 +2291,18 @@ function renderLayout() {
   const container = document.getElementById('layout-canvas');
   const legend = document.getElementById('layout-legend');
   if (!container || !legend) return;
+  const warningsHtml = computed.warnings.length
+    ? `<div class="calculation-warnings" role="alert"><strong>Revise o cálculo</strong><ul>${computed.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>`
+    : '';
   if (!computed.materialResults.length) {
-    container.innerHTML = '<div class="canvas-placeholder">Adicione peças para visualizar o encaixe.</div>';
+    container.innerHTML = `${warningsHtml}<div class="canvas-placeholder">Adicione peças válidas para visualizar o encaixe.</div>`;
     legend.innerHTML = '';
     return;
   }
   const resultsByMaterial = new Map(computed.materialResults.map((result) => [result.material.id, result]));
   const laminationMaterialIds = new Set(state.materials.map((material) => material.laminationMaterialId).filter(Boolean));
   const baseMaterials = state.materials.filter((material) => resultsByMaterial.has(material.id) || !laminationMaterialIds.has(material.id));
-  container.innerHTML = baseMaterials.map((material) => {
+  container.innerHTML = warningsHtml + baseMaterials.map((material) => {
     const result = resultsByMaterial.get(material.id);
     if (result) return renderMaterialResultBlock(result, true);
     const dimensions = material.calculationMode === 'sheet'
@@ -2154,6 +2377,13 @@ function buildItemsForMaterial(material) {
     }
   });
   return items;
+}
+
+function countPiecesForMaterial(material) {
+  return state.pieces.reduce((total, piece) => {
+    if (piece.materialId !== material.id || positive(piece.widthCm) <= 0 || positive(piece.heightCm) <= 0) return total;
+    return total + Math.max(0, Math.floor(positive(piece.quantity, 1)));
+  }, 0);
 }
 
 function rectanglesOverlap(a, b) {
@@ -2268,9 +2498,14 @@ function sortStrategies(items) {
   return strategies.map((compare) => [...items].sort(compare));
 }
 
-function chooseBestLayout(items, rollWidth, allowRotation, optimize = true) {
+function chooseBestLayout(items, rollWidth, allowRotation, optimize = true, maxLength = MAX_ROLL_LENGTH_MM) {
   if (!items.length) return { items: [], usedLength: 0, unfit: [] };
-  const runs = (optimize ? sortStrategies(items) : [items]).map((strategy) => packMaxRects(strategy, rollWidth, allowRotation));
+  const strategies = !optimize
+    ? [items]
+    : items.length > 250
+      ? [sortStrategies(items)[0]]
+      : sortStrategies(items);
+  const runs = strategies.map((strategy) => packMaxRects(strategy, rollWidth, allowRotation, maxLength));
   runs.sort((a, b) => {
     const aInvalid = a.unfit.length ? 1 : 0;
     const bInvalid = b.unfit.length ? 1 : 0;
@@ -2297,7 +2532,11 @@ function packIntoSheets(sourceItems, sheetWidth, sheetHeight, allowRotation, ord
 
 function chooseBestSheetLayouts(items, sheetWidth, sheetHeight, allowRotation, optimize = true) {
   if (!items.length) return { layouts: [], unfit: [] };
-  const strategies = optimize ? sortStrategies(items) : [items];
+  const strategies = !optimize
+    ? [items]
+    : items.length > 250
+      ? [sortStrategies(items)[0]]
+      : sortStrategies(items);
   const runs = strategies.map((strategy) => packIntoSheets(items, sheetWidth, sheetHeight, allowRotation, strategy));
   const usedLengthScore = (run) => run.layouts.reduce((total, layout) => total + layout.usedLength, 0);
   runs.sort((a, b) => a.unfit.length - b.unfit.length || a.layouts.length - b.layouts.length || usedLengthScore(a) - usedLengthScore(b));
@@ -2316,6 +2555,13 @@ function calculateQuote() {
   const result = emptyComputed();
   const warnings = [];
   state.materials.forEach((material) => {
+    const materialPieceCount = countPiecesForMaterial(material);
+    if (materialPieceCount > MAX_LAYOUT_PIECES_PER_MATERIAL) {
+      const message = `${material.name}: ${materialPieceCount} peças excedem o limite de ${MAX_LAYOUT_PIECES_PER_MATERIAL} peças por material. Reduza as quantidades para gerar um orçamento completo.`;
+      warnings.push(message);
+      result.blockingErrors.push(message);
+      return;
+    }
     const items = buildItemsForMaterial(material);
     if (!items.length) return;
     const pieceAreaM2 = items.reduce((sum, item) => sum + (item.originalW * item.originalH) / 1000000, 0);
@@ -2363,7 +2609,11 @@ function calculateQuote() {
       const pricing = resolveMaterialPricing(material, billingQuantity);
       const cost = billingQuantity * pricing.unitPrice;
       const unfitNames = sheetPacking.unfit.map((item) => item.description);
-      if (unfitNames.length) warnings.push(`${material.name}: ${unfitNames.join(', ')} não coube em nenhuma chapa.`);
+      if (unfitNames.length) {
+        const message = `${material.name}: ${unfitNames.length} peça(s) não couberam em nenhuma chapa.`;
+        warnings.push(message);
+        result.blockingErrors.push(message);
+      }
       const layout = {
         items: layouts.flatMap((sheetLayout) => sheetLayout.items),
         usedLength: sheetHeight * sheetCount,
@@ -2400,7 +2650,7 @@ function calculateQuote() {
       warnings.push(`${material.name}: informe a largura da bobina.`);
       return;
     }
-    const layout = chooseBestLayout(items, rollWidth, material.rotate, state.optimize);
+    const layout = chooseBestLayout(items, rollWidth, material.rotate, state.optimize, MAX_ROLL_LENGTH_MM);
     layout.items.forEach((item) => {
       item.description = item.description || 'Peça';
     });
@@ -2410,7 +2660,11 @@ function calculateQuote() {
     const pricing = resolveMaterialPricing(material, billingQuantity);
     const cost = billingQuantity * pricing.unitPrice;
     const unfitNames = layout.unfit.map((item) => item.description);
-    if (layout.unfit.length) warnings.push(`${material.name}: ${unfitNames.join(', ')} não coube na largura informada.`);
+    if (layout.unfit.length) {
+      const message = `${material.name}: ${layout.unfit.length} peça(s) não couberam na largura informada dentro do limite de uma bobina de 50 m.`;
+      warnings.push(message);
+      result.blockingErrors.push(message);
+    }
     const materialResult = {
       material,
       calculationMode: 'roll',
@@ -2476,15 +2730,17 @@ function calculateQuote() {
           const warning = `${unfitNames.join(', ')} não coube em nenhuma chapa de laminação.`;
           laminateWarnings.push(warning);
           warnings.push(`${laminate.name}: ${warning}`);
+          result.blockingErrors.push(`${laminate.name}: ${warning}`);
         }
       } else {
-        laminationLayout = chooseBestLayout(buildItemsForMaterial(baseResult.material), laminateWidth, laminate.rotate, state.optimize);
+        laminationLayout = chooseBestLayout(buildItemsForMaterial(baseResult.material), laminateWidth, laminate.rotate, state.optimize, MAX_ROLL_LENGTH_MM);
         laminationUsedLengthM = laminationLayout.usedLength / 1000;
         const unfitNames = laminationLayout.unfit.map((item) => item.description);
         if (unfitNames.length) {
-          const warning = `${unfitNames.join(', ')} não coube na largura informada para laminação.`;
+          const warning = `${unfitNames.length} peça(s) não couberam na largura da laminação dentro do limite de uma bobina de 50 m.`;
           laminateWarnings.push(warning);
           warnings.push(`${laminate.name}: ${warning}`);
+          result.blockingErrors.push(`${laminate.name}: ${warning}`);
         }
       }
     }
@@ -2820,6 +3076,10 @@ function toggleInstallationPanel() {
 }
 
 async function saveQuote() {
+  if (computed.blockingErrors.length) {
+    showToast(computed.blockingErrors[0], 'error');
+    return;
+  }
   const name = state.quoteName.trim() || `Orçamento ${new Date().toLocaleDateString('pt-BR')}`;
   const id = state.quoteId || uid('quote');
   const snapshot = clone(state);
@@ -2980,7 +3240,7 @@ function resetSavedMaterialForm() {
   setValue('saved-material-calculation-mode', 'roll');
   setValue('saved-material-gap', 2);
   const title = document.getElementById('saved-material-form-title');
-  if (title) title.textContent = 'Novo material';
+  if (title) title.textContent = 'Novo material base';
   const rotate = document.getElementById('saved-material-rotate');
   if (rotate) rotate.checked = true;
   syncSavedMaterialFormMode();
@@ -3001,7 +3261,7 @@ function editSavedMaterial(id) {
   const rotate = document.getElementById('saved-material-rotate');
   if (rotate) rotate.checked = material.rotate !== false;
   const title = document.getElementById('saved-material-form-title');
-  if (title) title.textContent = 'Editar material';
+  if (title) title.textContent = 'Editar material base';
   syncSavedMaterialFormMode();
   document.getElementById('saved-material-form-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
@@ -3228,6 +3488,10 @@ function handleClick(event) {
 function handleInput(event) {
   const element = event.target;
   if (!(element.matches('input, select, textarea'))) return;
+  if (element.id === 'catalog-item-basis') {
+    updateCatalogPricingControls();
+    return;
+  }
   if (element.id === 'profile-postal-code') {
     if (event.type === 'input') lookupAddressFromPostalCode(element);
     return;
@@ -3302,7 +3566,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261006-sync-version-control-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261007-sync-catalog-limit-v1').catch(() => undefined);
 }
 
 initialize();
