@@ -722,6 +722,77 @@ function cloudPayloadMatchesLocal(recordType, local, payload) {
   return stripSyncMetadata(local) === stripSyncMetadata(payload);
 }
 
+function stableCloudValue(value) {
+  if (Array.isArray(value)) return value.map(stableCloudValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableCloudValue(value[key])]));
+}
+
+function cloudSyncPayloadsEqual(recordType, left, right) {
+  if (recordType === 'draft') {
+    return JSON.stringify(stableCloudValue({ value: left?.value, cloudIntent: left?.cloudIntent === true }))
+      === JSON.stringify(stableCloudValue({ value: right?.value, cloudIntent: right?.cloudIntent === true }));
+  }
+  const stripSyncMetadata = (value) => {
+    if (!value || typeof value !== 'object') return value;
+    const copy = clone(value);
+    delete copy._syncUpdatedAt;
+    delete copy.updatedAt;
+    return stableCloudValue(copy);
+  };
+  return JSON.stringify(stripSyncMetadata(left)) === JSON.stringify(stripSyncMetadata(right));
+}
+
+async function preserveRejectedCloudMutation(item) {
+  if (!item?.payload) return false;
+  const now = new Date().toISOString();
+  if (item.recordType === 'draft' && item.payload.value) {
+    const snapshot = clone(item.payload.value);
+    const id = uid('quote-conflict');
+    const name = `Cópia de conflito — rascunho ${new Date().toLocaleString('pt-BR')}`;
+    snapshot.quoteId = id;
+    snapshot.quoteName = name;
+    const quote = {
+      id, name, snapshot, updatedAt: now, isConflictCopy: true,
+      piecesCount: (snapshot.pieces || []).reduce((sum, piece) => sum + Math.max(0, Math.floor(positive(piece.quantity, 1))), 0),
+      materialsCount: (snapshot.materials || []).length,
+    };
+    await storePut('quotes', quote);
+    savedQuotes = [quote, ...savedQuotes].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    renderQuotes();
+    return true;
+  }
+  if (item.recordType === 'quote') {
+    const id = uid('quote-conflict');
+    const quote = {
+      ...clone(item.payload), id,
+      name: `Cópia de conflito — ${item.payload.name || 'Orçamento sem nome'}`,
+      updatedAt: now,
+      isConflictCopy: true,
+    };
+    await storePut('quotes', quote);
+    savedQuotes = [quote, ...savedQuotes].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    renderQuotes();
+    return true;
+  }
+  if (item.recordType === 'material' && item.payload.id) {
+    const original = item.payload;
+    const isCatalogItem = Boolean(original.catalogCategory) || String(item.recordId).startsWith('catalog:');
+    const id = isCatalogItem ? `catalog:${uid('conflict')}` : uid('material-conflict');
+    const copy = { ...clone(original), id, name: `Cópia de conflito — ${original.name || 'Material'}`, updatedAt: now, isConflictCopy: true };
+    await storePut('materials', copy);
+    if (isCatalogItem) {
+      savedCatalogItems = [copy, ...savedCatalogItems].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+      renderCatalogItems();
+    } else {
+      savedMaterials = [normalizeMaterial(copy), ...savedMaterials];
+      renderSavedMaterials();
+    }
+    return true;
+  }
+  return false;
+}
+
 async function applyCloudRecords(records) {
   let draftChanged = false;
   let materialsChanged = false;
@@ -821,18 +892,40 @@ async function syncCloudNow() {
       is_deleted: item.deleted,
       updated_at: item.updatedAt,
     }));
+    const conflictItems = [];
+    const conflictedDeletes = [];
     for (let index = 0; index < changes.length; index += 100) {
-      await cloudFetch('/rest/v1/rpc/sync_grafiflow_records', {
+      const batch = queue.slice(index, index + 100);
+      const syncedRows = await cloudFetch('/rest/v1/rpc/sync_grafiflow_records', {
         method: 'POST', token: session.access_token,
         body: { target_workspace_id: cloudWorkspaceId, changes: changes.slice(index, index + 100) },
       });
+      if (!Array.isArray(syncedRows)) throw new Error('O Supabase não confirmou as alterações enviadas. A fila local foi preservada.');
+      const rowsByKey = new Map(syncedRows.map((row) => [`${row.record_type}:${row.record_id}`, row]));
+      for (const item of batch) {
+        const remote = rowsByKey.get(`${item.recordType}:${item.recordId}`);
+        if (!remote) throw new Error('O Supabase não confirmou um registro enviado. A fila local foi preservada.');
+        const rejected = item.deleted
+          ? !remote.is_deleted
+          : remote.is_deleted || !cloudSyncPayloadsEqual(item.recordType, item.payload, remote.payload);
+        if (!rejected) continue;
+        if (item.deleted) conflictedDeletes.push(item);
+        else conflictItems.push(item);
+      }
     }
+    const completedQueueIds = new Set();
     for (const item of queue) {
       const current = await storeGet('syncQueue', item.id);
       if (current?.updatedAt === item.updatedAt) {
         const db = await openDatabase();
         if (db) await idbRequest(db.transaction('syncQueue', 'readwrite').objectStore('syncQueue').delete(item.id));
+        completedQueueIds.add(item.id);
       }
+    }
+    let preservedConflicts = 0;
+    for (const item of conflictItems) {
+      if (!completedQueueIds.has(item.id)) continue;
+      if (await preserveRejectedCloudMutation(item)) preservedConflicts += 1;
     }
     const records = [];
     let offset = 0;
@@ -844,6 +937,13 @@ async function syncCloudNow() {
       offset += page.length;
     }
     await applyCloudRecords(records);
+    if (preservedConflicts) {
+      showToast(`${preservedConflicts} versão(ões) local(is) conflitante(s) foi(foram) guardada(s) como cópia. Confira o histórico e o catálogo.`, 'error');
+    }
+    const preservedDeleteConflicts = conflictedDeletes.filter((item) => completedQueueIds.has(item.id)).length;
+    if (preservedDeleteConflicts) {
+      showToast(`${preservedDeleteConflicts} exclusão(ões) local(is) não prevaleceu(ram); a versão da nuvem foi mantida.`, 'error');
+    }
     syncSucceeded = true;
     updateAccountStatus('Sincronizado');
   } catch (error) {
@@ -3180,7 +3280,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261006-sidebar-logo-fix-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261006-sync-hardening-v1').catch(() => undefined);
 }
 
 initialize();

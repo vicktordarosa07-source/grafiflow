@@ -1,11 +1,11 @@
-const CACHE_NAME = 'grafiflow-static-v27';
+const CACHE_NAME = 'grafiflow-static-v28';
 const APP_SHELL = [
   './',
   './index.html',
-  './styles.css?v=20261006-sidebar-logo-fix-v1',
-  './app.js?v=20261006-sidebar-logo-fix-v1',
-  './config.js?v=20261006-sidebar-logo-fix-v1',
-  './manifest.webmanifest?v=20261006-sidebar-logo-fix-v1',
+  './styles.css?v=20261006-sync-hardening-v1',
+  './app.js?v=20261006-sync-hardening-v1',
+  './config.js?v=20261006-sync-hardening-v1',
+  './manifest.webmanifest?v=20261006-sync-hardening-v1',
   './grafiflow-favicon-v3.png',
   './grafiflow-logo.jpg',
   './grafiflow-icon-192-v3.png',
@@ -13,6 +13,7 @@ const APP_SHELL = [
   './grafiflow-icon-maskable-192-v3.png',
   './grafiflow-icon-maskable-512-v3.png',
 ];
+const APP_SHELL_URLS = new Set(APP_SHELL.map((asset) => new URL(asset, self.location.href).href));
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting()));
@@ -24,9 +25,25 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
-  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
-    const copy = response.clone();
-    caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
-    return response;
-  }).catch(() => caches.match('./index.html'))));
+  const requestUrl = new URL(event.request.url);
+  if (requestUrl.origin !== self.location.origin) return;
+  const isAppShellAsset = APP_SHELL_URLS.has(requestUrl.href);
+  const isNavigation = event.request.mode === 'navigate';
+  if (!isAppShellAsset && !isNavigation) return;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    try {
+      const response = await fetch(event.request);
+      if (isAppShellAsset && response.ok) await cache.put(event.request, response.clone());
+      return response;
+    } catch (error) {
+      const cached = await cache.match(event.request);
+      if (cached) return cached;
+      if (isNavigation) {
+        const appShell = await cache.match(new URL('./index.html', self.location.href).href);
+        if (appShell) return appShell;
+      }
+      throw error;
+    }
+  })());
 });
