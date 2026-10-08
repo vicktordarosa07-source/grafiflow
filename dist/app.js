@@ -115,6 +115,8 @@ let cloudSyncRunning = false;
 let cloudSyncRequested = false;
 let cloudSyncChannel = null;
 let cloudPollTimer = null;
+let cloudDraftDeferred = false;
+let cloudDraftFocusoutTimer = null;
 let fullSyncRunning = false;
 let authMode = 'login';
 let authNotice = '';
@@ -715,6 +717,22 @@ function syncAfterWake() {
   syncCloudNow().catch((error) => updateAccountStatus(error.message || 'Sincronização indisponível'));
 }
 
+function hasFocusedEditor() {
+  const active = document.activeElement;
+  return Boolean(active && active !== document.body && active.matches?.('input, textarea, select, [contenteditable="true"]'));
+}
+
+function scheduleDeferredDraftSync() {
+  if (!cloudDraftDeferred) return;
+  clearTimeout(cloudDraftFocusoutTimer);
+  cloudDraftFocusoutTimer = setTimeout(() => {
+    cloudDraftFocusoutTimer = null;
+    if (!cloudDraftDeferred || hasFocusedEditor()) return;
+    cloudDraftDeferred = false;
+    syncAfterWake();
+  }, 450);
+}
+
 function initializeCrossTabSync() {
   if ('BroadcastChannel' in window) {
     cloudSyncChannel = new BroadcastChannel('grafiflow-cloud-sync-v1');
@@ -728,6 +746,7 @@ function initializeCrossTabSync() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) syncAfterWake();
   });
+  document.addEventListener('focusout', scheduleDeferredDraftSync);
   window.addEventListener('focus', syncAfterWake);
 }
 
@@ -869,6 +888,7 @@ async function preserveRejectedCloudMutation(item) {
 
 async function applyCloudRecords(records) {
   let draftChanged = false;
+  let draftDeferred = false;
   let materialsChanged = false;
   let catalogChanged = false;
   let quotesChanged = false;
@@ -884,9 +904,17 @@ async function applyCloudRecords(records) {
     const isCatalogItem = isCatalogType || isLegacyCatalogType;
     if (record.is_deleted) {
       if (record.record_type === 'material' && cloudIncrementalSyncAvailable && local?.catalogCategory) continue;
-      if (!local || (record.record_type === 'draft' && draftTimer)) continue;
+      if (!local) continue;
+      if (record.record_type === 'draft' && (draftTimer || hasFocusedEditor())) {
+        draftDeferred = true;
+        cloudDraftDeferred = true;
+        continue;
+      }
       await storeDelete(storeName, localId, { fromCloud: true });
-      if (record.record_type === 'draft') draftChanged = true;
+      if (record.record_type === 'draft') {
+        cloudDraftDeferred = false;
+        draftChanged = true;
+      }
       if (record.record_type === 'material') {
         savedMaterials = savedMaterials.filter((item) => item.id !== record.record_id);
         materialsChanged = true;
@@ -909,8 +937,14 @@ async function applyCloudRecords(records) {
       continue;
     }
     if (record.record_type === 'draft') {
-      if (!payload?.value || draftTimer) continue;
+      if (!payload?.value) continue;
+      if (draftTimer || hasFocusedEditor()) {
+        draftDeferred = true;
+        cloudDraftDeferred = true;
+        continue;
+      }
       await storePut('settings', { key: 'draft', value: payload.value, updatedAt: record.updated_at, cloudIntent: payload.cloudIntent === true, _cloudVersionAt: record.updated_at }, { fromCloud: true });
+      cloudDraftDeferred = false;
       hydrateState(payload.value);
       draftChanged = true;
     } else if (isCatalogItem && (payload?.catalogCategory || catalogCategory)) {
@@ -946,6 +980,7 @@ async function applyCloudRecords(records) {
     if (quotesChanged) renderQuotes();
   }
   if (draftChanged && catalogChanged) renderCatalogItems();
+  return draftDeferred;
 }
 
 async function cloudSyncCursor() {
@@ -1038,7 +1073,8 @@ async function downloadIncrementalCloudChanges(session) {
     });
     if (!Array.isArray(page)) throw new Error('O Supabase não retornou uma página válida de alterações.');
     if (!page.length) break;
-    await applyCloudRecords(page);
+    const draftDeferred = await applyCloudRecords(page);
+    if (draftDeferred) return;
     const nextCursor = page.reduce((maximum, record) => Math.max(maximum, Number(record.change_seq) || 0), cursor);
     if (nextCursor <= cursor) throw new Error('A sincronização incremental recebeu um cursor inválido; nenhuma alteração foi descartada.');
     cursor = nextCursor;
@@ -3566,7 +3602,7 @@ function initialize() {
     renderAll({ persistDraft: false });
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261007-sync-catalog-limit-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261007-tablet-keyboard-focus-v1').catch(() => undefined);
 }
 
 initialize();
