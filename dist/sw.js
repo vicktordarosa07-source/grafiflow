@@ -1,11 +1,11 @@
-const CACHE_NAME = 'grafiflow-static-v31';
+const CACHE_NAME = 'grafiflow-static-v32';
 const APP_SHELL = [
   './',
   './index.html',
-  './styles.css?v=20261007-tablet-keyboard-focus-v1',
-  './app.js?v=20261007-tablet-keyboard-focus-v1',
-  './config.js?v=20261007-tablet-keyboard-focus-v1',
-  './manifest.webmanifest?v=20261007-tablet-keyboard-focus-v1',
+  './styles.css?v=20261007-phone-pdf-button-v1',
+  './app.js?v=20261007-phone-pdf-button-v1',
+  './config.js?v=20261007-phone-pdf-button-v1',
+  './manifest.webmanifest?v=20261007-phone-pdf-button-v1',
   './grafiflow-favicon-v3.png',
   './grafiflow-logo.jpg',
   './grafiflow-icon-192-v3.png',

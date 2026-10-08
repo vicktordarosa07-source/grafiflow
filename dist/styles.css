@@ -347,7 +347,7 @@ input:disabled, select:disabled { color: #8195a1; background: #edf3f6; }
   .page-heading { display: none; }
   .topbar-actions { margin-left: auto; gap: 6px; }
   .topbar-actions .secondary-button { display: none; }
-  .topbar-actions .install-button { display: inline-flex; }
+  .topbar-actions .install-button:not([hidden]) { display: inline-flex; }
   .topbar-actions .clear-quote-button { display: inline-flex; padding: 9px 10px; font-size: 0.72rem; }
   .primary-button { padding: 10px 12px; font-size: 0.75rem; }
   .content-wrap { padding: 25px 14px 45px; }
@@ -436,8 +436,13 @@ input:disabled, select:disabled { color: #8195a1; background: #edf3f6; }
 .account-offline-note { margin: 20px 0 0; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.74rem; line-height: 1.5; }
 
 @media (max-width: 650px) {
+  .primary-column { grid-template-columns: minmax(0, 1fr); }
+  .primary-column > .panel { min-width: 0; }
+  .topbar-actions { width: 100%; margin-left: 0; justify-content: flex-start; }
+  .panel-heading { flex-wrap: wrap; }
   .topbar-actions .account-button { display: inline-flex; padding: 8px 9px; font-size: 0.67rem; }
   .topbar-actions #manual-sync-button { display: inline-flex; padding: 8px 9px; font-size: 0.67rem; }
+  .topbar-actions #print-button { display: inline-flex; padding: 8px 9px; font-size: 0.67rem; }
 }
 
 .catalog-extras-panel { margin-top: 18px; }
