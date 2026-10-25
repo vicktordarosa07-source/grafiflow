@@ -1,1 +1,1 @@
-window.GRAFIFLOW_CONFIG = Object.freeze({ supabaseUrl: '', supabaseAnonKey: '' });
+window.GRAFIFLOW_CONFIG = Object.freeze({ supabaseUrl: '', supabaseAnonKey: '', supabaseCaptchaSiteKey: '' });

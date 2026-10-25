@@ -425,6 +425,12 @@ input:disabled, select:disabled { color: #8195a1; background: #edf3f6; }
 .account-auth-form .field { min-width: 0; }
 .account-submit { width: 100%; margin-top: 3px; }
 .account-modal-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 15px; }
+.auth-password-hint { display: block; margin-top: -8px; color: var(--muted); font-size: 0.72rem; line-height: 1.45; }
+.auth-password-hint[hidden] { display: none; }
+.auth-captcha-wrap { display: grid; justify-items: center; gap: 6px; margin-top: 16px; min-height: 0; }
+.auth-captcha-wrap[hidden] { display: none; }
+.auth-captcha-wrap p { margin: 0; color: var(--muted); font-size: 0.68rem; text-align: center; }
+.auth-captcha-wrap > div { min-height: 0; }
 .account-settings-view:not([hidden]) { display: grid; gap: 16px; }
 .account-form-grid { gap: 10px; }
 .account-cep-status { display: block; margin-top: 4px; color: var(--muted); font-size: 0.68rem; line-height: 1.35; }
