@@ -1,6 +1,6 @@
-import { captchaSecurityMetadata, localDatabaseForAccount, MIN_PASSWORD_LENGTH, userFacingAuthError, validateRegistration } from './auth-flow.js?v=20261025-secure-account-v1';
+import { captchaSecurityMetadata, localDatabaseForAccount, MIN_PASSWORD_LENGTH, userFacingAuthError, userFacingCloudError, validateRegistration } from './auth-flow.js?v=20261025-cloud-error-v2';
 
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.1';
 const DB_NAME = 'nesto-local-v1';
 const DB_VERSION = 2;
 const CLOUD_SESSION_KEY = 'grafiflow.auth.v1';
@@ -849,7 +849,7 @@ async function synchronizeAllData() {
     showToast('Sincronização concluída. As alterações locais e remotas foram comparadas e atualizadas.');
   } catch (error) {
     console.error('Falha ao sincronizar todos os dados.', error);
-    showToast(error.message || 'Não foi possível concluir a sincronização.', 'error');
+    showToast(userFacingCloudError(error, 'sync'), 'error');
   } finally {
     fullSyncRunning = false;
     buttons.forEach((id) => {
@@ -868,7 +868,7 @@ function syncAfterWake() {
     restoreCloudAccount();
     return;
   }
-  syncCloudNow().catch((error) => updateAccountStatus(error.message || 'Sincronização indisponível'));
+  syncCloudNow().catch((error) => updateAccountStatus(userFacingCloudError(error, 'sync')));
 }
 
 function hasFocusedEditor() {
@@ -1330,7 +1330,7 @@ async function syncCloudNow() {
     syncSucceeded = true;
     updateAccountStatus('Sincronizado');
   } catch (error) {
-    updateAccountStatus(error?.message || 'Falha na sincronização. Tentaremos novamente.');
+    updateAccountStatus(userFacingCloudError(error, 'sync'));
     throw error;
   } finally {
     cloudSyncRunning = false;
@@ -1366,8 +1366,9 @@ async function activateCloudSession(session) {
     await syncCloudNow();
   } catch (error) {
     console.warn('Não foi possível iniciar a sincronização da conta.', error);
-    updateAccountStatus(error.message || 'Sincronização indisponível');
-    showToast(error.message || 'Não foi possível iniciar a sincronização.', 'error');
+    const message = userFacingCloudError(error, 'sync');
+    updateAccountStatus(message);
+    showToast(message, 'error');
   }
 }
 
@@ -1404,7 +1405,7 @@ async function restoreCloudAccount() {
       saveCloudSession(null);
       cloudWorkspaceId = '';
     }
-    updateAccountStatus(error.message || 'Sincronização indisponível');
+    updateAccountStatus(userFacingCloudError(error, 'sync'));
   }
 }
 
@@ -1507,7 +1508,7 @@ function openAccountModal() {
   renderAuthCaptcha();
   if (authMode === 'account') {
     fillAccountProfileForm();
-    loadAccountProfile().catch((error) => updateAccountStatus(error.message || 'Não foi possível carregar o perfil.'));
+    loadAccountProfile().catch((error) => updateAccountStatus(userFacingCloudError(error, 'profile')));
   }
 }
 
@@ -1762,7 +1763,7 @@ async function submitAccountProfile(event) {
     updateAccountStatus();
     showToast('Dados da conta atualizados.');
   } catch (error) {
-    showToast(error.message || 'Não foi possível salvar os dados da conta.', 'error');
+    showToast(userFacingCloudError(error, 'profile'), 'error');
   } finally {
     if (button) button.disabled = false;
   }
@@ -3912,7 +3913,7 @@ function initialize() {
     } catch { /* aviso temporário */ }
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261025-secure-account-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261025-cloud-error-v2').catch(() => undefined);
 }
 
 initialize();

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { captchaSecurityMetadata, localDatabaseForAccount, MIN_PASSWORD_LENGTH, userFacingAuthError, validateRegistration } from '../dist/auth-flow.js';
+import { captchaSecurityMetadata, localDatabaseForAccount, MIN_PASSWORD_LENGTH, userFacingAuthError, userFacingCloudError, validateRegistration } from '../dist/auth-flow.js';
 
 test('registration requires a full name, valid email, long password, and matching confirmation', () => {
   assert.equal(validateRegistration({ fullName: '', email: 'a@example.com', password: 'a'.repeat(12), confirmation: 'a'.repeat(12) }).ok, false);
@@ -55,4 +55,13 @@ test('authentication errors do not expose server details or reveal registered em
   assert.match(userFacingAuthError(new Error('email not confirmed')), /Confirme seu e-mail/);
   assert.match(userFacingAuthError(new Error('captcha verification failed')), /verificação antirobô/);
   assert.match(userFacingAuthError(new Error('over_email_send_rate_limit')), /Aguarde alguns minutos/);
+});
+
+test('cloud connection errors are clear and do not expose raw browser diagnostics', () => {
+  const message = userFacingCloudError(new TypeError('Failed to fetch'), 'profile');
+  assert.match(message, /Confira a internet/);
+  assert.match(message, /dados continuam salvos neste dispositivo/);
+  assert.doesNotMatch(message, /Failed to fetch/);
+  assert.match(userFacingCloudError({ status: 401 }, 'sync'), /Entre novamente/);
+  assert.match(userFacingCloudError(new Error('relation public.profiles does not exist'), 'profile'), /migrações do GrafiFlow/);
 });

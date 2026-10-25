@@ -67,3 +67,26 @@ export function userFacingAuthError(error, action = 'login') {
   if (action === 'signup') return 'Não foi possível concluir o cadastro. Confira os dados e tente novamente.';
   return 'Não foi possível concluir o acesso. Confira os dados e tente novamente.';
 }
+
+export function userFacingCloudError(error, action = 'sync') {
+  const message = `${error?.message || error || ''} ${error?.code || ''}`.toLowerCase();
+  const status = Number(error?.status || 0);
+  if (/failed to fetch|networkerror|network|load failed|timed out|não foi possível conectar/.test(message)) {
+    return 'Não foi possível conectar aos serviços do GrafiFlow. Confira a internet e tente novamente. Seus dados continuam salvos neste dispositivo.';
+  }
+  if (status === 401 || /jwt expired|invalid jwt|session.*expired/.test(message)) {
+    return 'Sua sessão não foi aceita pelo servidor. Entre novamente para continuar.';
+  }
+  if (status === 403 || /permission denied|row level security|not allowed/.test(message)) {
+    return 'O servidor não autorizou o acesso aos dados desta conta. Confira as permissões do projeto Supabase.';
+  }
+  if (/profiles|perfil da conta|migração do perfil|schema cache|pgrst205|42p01/.test(message)) {
+    return 'O perfil da conta não está configurado no Supabase. É necessário aplicar as migrações do GrafiFlow nesse projeto.';
+  }
+  if (/workspace|espaço de trabalho/.test(message)) {
+    return 'O espaço de trabalho da conta ainda não está disponível. Confira as migrações do GrafiFlow no Supabase.';
+  }
+  return action === 'profile'
+    ? 'Não foi possível carregar os dados da conta. Tente novamente em instantes.'
+    : 'A sincronização está indisponível agora. Os dados locais continuam salvos e serão enviados quando a conexão voltar.';
+}
