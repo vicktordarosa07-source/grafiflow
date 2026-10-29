@@ -1,9 +1,13 @@
-const APP_VERSION = '1.2.0';
+import { captchaSecurityMetadata, localDatabaseForAccount, MIN_PASSWORD_LENGTH, userFacingAuthError, userFacingCloudError, validateRegistration } from './auth-flow.js?v=20261025-cloud-error-v2';
+
+const APP_VERSION = '1.3.1';
 const DB_NAME = 'nesto-local-v1';
 const DB_VERSION = 2;
 const CLOUD_SESSION_KEY = 'grafiflow.auth.v1';
 const CLOUD_WORKSPACE_KEY = 'grafiflow.workspace.v1';
 const CLOUD_OWNER_KEY = 'grafiflow.local.owner.v1';
+const CLOUD_PRIMARY_OWNER_KEY = 'grafiflow.local.primary-owner.v1';
+const LOCAL_DATA_NOTICE_KEY = 'grafiflow.local.notice.v1';
 const SYNC_CURSOR_KEY = 'grafiflow.sync.cursor.v1';
 const MAX_ROLL_LENGTH_MM = 50000;
 const MAX_LAYOUT_PIECES_PER_MATERIAL = 1000;
@@ -120,6 +124,11 @@ let cloudDraftFocusoutTimer = null;
 let fullSyncRunning = false;
 let authMode = 'login';
 let authNotice = '';
+let pendingConfirmationEmail = '';
+let authCaptchaToken = '';
+let authCaptchaWidgetId = null;
+let authCaptchaLoadPromise = null;
+let authCaptchaForPasswordChange = false;
 let accountProfile = null;
 let postalLookupController = null;
 let postalLookupSequence = 0;
@@ -258,11 +267,67 @@ function getMaterial(materialId) {
   return state.materials.find((material) => material.id === materialId) || state.materials[0];
 }
 
+function localDatabaseName() {
+  let activeOwnerId = '';
+  let primaryOwnerId = '';
+  let sessionOwnerId = '';
+  try {
+    activeOwnerId = localStorage.getItem(CLOUD_OWNER_KEY) || '';
+    primaryOwnerId = localStorage.getItem(CLOUD_PRIMARY_OWNER_KEY) || '';
+    const savedSession = JSON.parse(localStorage.getItem(CLOUD_SESSION_KEY) || 'null');
+    sessionOwnerId = savedSession?.user?.id || '';
+    if (!primaryOwnerId && activeOwnerId) {
+      primaryOwnerId = activeOwnerId;
+      localStorage.setItem(CLOUD_PRIMARY_OWNER_KEY, primaryOwnerId);
+    }
+    if (!primaryOwnerId && sessionOwnerId) {
+      primaryOwnerId = sessionOwnerId;
+      localStorage.setItem(CLOUD_PRIMARY_OWNER_KEY, primaryOwnerId);
+    }
+    if (sessionOwnerId && sessionOwnerId !== activeOwnerId) {
+      activeOwnerId = sessionOwnerId;
+      localStorage.setItem(CLOUD_OWNER_KEY, activeOwnerId);
+      localStorage.removeItem(CLOUD_WORKSPACE_KEY);
+      localStorage.removeItem(SYNC_CURSOR_KEY);
+    } else if (!sessionOwnerId && activeOwnerId) {
+      activeOwnerId = '';
+      localStorage.removeItem(CLOUD_OWNER_KEY);
+    }
+  } catch { /* o modo local continua disponível sem armazenamento de preferências */ }
+  return localDatabaseForAccount({ baseName: DB_NAME, activeOwnerId, primaryOwnerId, sessionOwnerId });
+}
+
+function selectLocalDataOwner(ownerId) {
+  const nextOwnerId = String(ownerId || '').trim();
+  if (!nextOwnerId) return false;
+  let activeOwnerId = '';
+  let primaryOwnerId = '';
+  try {
+    activeOwnerId = localStorage.getItem(CLOUD_OWNER_KEY) || '';
+    primaryOwnerId = localStorage.getItem(CLOUD_PRIMARY_OWNER_KEY) || '';
+    if (!primaryOwnerId) {
+      primaryOwnerId = activeOwnerId || nextOwnerId;
+      localStorage.setItem(CLOUD_PRIMARY_OWNER_KEY, primaryOwnerId);
+    }
+    if (activeOwnerId === nextOwnerId) return false;
+    localStorage.setItem(CLOUD_OWNER_KEY, nextOwnerId);
+    localStorage.removeItem(CLOUD_WORKSPACE_KEY);
+    localStorage.removeItem(SYNC_CURSOR_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function queueLocalDataNotice(message) {
+  try { localStorage.setItem(LOCAL_DATA_NOTICE_KEY, message); } catch { /* aviso temporário */ }
+}
+
 function openDatabase() {
   if (dbPromise) return dbPromise;
   if (!('indexedDB' in window) || !window.indexedDB) return Promise.resolve(null);
   dbPromise = new Promise((resolve, reject) => {
-    const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+    const request = window.indexedDB.open(localDatabaseName(), DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains('quotes')) db.createObjectStore('quotes', { keyPath: 'id' });
@@ -339,6 +404,95 @@ function cloudConfig() {
 function cloudConfigured() {
   const config = cloudConfig();
   return Boolean(config.url && config.key);
+}
+
+function authCaptchaSiteKey() {
+  return String(window.GRAFIFLOW_CONFIG?.supabaseCaptchaSiteKey || '').trim();
+}
+
+function authCaptchaRequired() {
+  if (!authCaptchaSiteKey()) return false;
+  return ['login', 'signup', 'recovery-request'].includes(authMode) || authCaptchaForPasswordChange;
+}
+
+function authCaptchaPayload() {
+  if (!authCaptchaSiteKey()) return {};
+  if (!authCaptchaToken) throw new Error('Complete a verificação antirobô antes de continuar.');
+  return captchaSecurityMetadata(authCaptchaToken);
+}
+
+function resetAuthCaptcha() {
+  authCaptchaToken = '';
+  if (authCaptchaWidgetId !== null && window.turnstile?.reset) {
+    try { window.turnstile.reset(authCaptchaWidgetId); } catch { /* o widget será recriado se necessário */ }
+  }
+}
+
+function loadTurnstileScript() {
+  if (window.turnstile?.render) return Promise.resolve();
+  if (authCaptchaLoadPromise) return authCaptchaLoadPromise;
+  authCaptchaLoadPromise = new Promise((resolve, reject) => {
+    let script = document.getElementById('grafiflow-turnstile-script');
+    const fail = () => reject(new Error('A verificação antirobô não carregou.'));
+    if (script) {
+      script.addEventListener('load', () => window.turnstile?.render ? resolve() : fail(), { once: true });
+      script.addEventListener('error', fail, { once: true });
+      if (window.turnstile?.render) resolve();
+    } else {
+      script = document.createElement('script');
+      script.id = 'grafiflow-turnstile-script';
+      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      script.async = true;
+      script.defer = true;
+      script.addEventListener('load', () => window.turnstile?.render ? resolve() : fail(), { once: true });
+      script.addEventListener('error', fail, { once: true });
+      document.head.append(script);
+    }
+  });
+  return authCaptchaLoadPromise;
+}
+
+async function renderAuthCaptcha() {
+  const wrapper = document.getElementById('auth-captcha-wrap');
+  const target = document.getElementById('auth-captcha');
+  if (!wrapper || !target) return;
+  const needsCaptcha = authCaptchaRequired();
+  wrapper.hidden = !needsCaptcha;
+  if (!needsCaptcha || document.getElementById('account-modal')?.hidden) return;
+  try {
+    await loadTurnstileScript();
+    if (authCaptchaWidgetId !== null) {
+      window.turnstile.reset(authCaptchaWidgetId);
+      authCaptchaToken = '';
+      updateAccountStatus();
+      return;
+    }
+    authCaptchaWidgetId = window.turnstile.render(target, {
+      sitekey: authCaptchaSiteKey(),
+      callback: (token) => {
+        authCaptchaToken = String(token || '');
+        authNotice = '';
+        updateAccountStatus();
+      },
+      'expired-callback': () => {
+        authCaptchaToken = '';
+        updateAccountStatus();
+      },
+      'error-callback': () => {
+        authCaptchaToken = '';
+        authNotice = 'A verificação de segurança falhou. Tente novamente.';
+        updateAccountStatus();
+      },
+      theme: 'auto',
+    });
+  } catch (error) {
+    if (!window.turnstile?.render) {
+      document.getElementById('grafiflow-turnstile-script')?.remove();
+      authCaptchaLoadPromise = null;
+    }
+    authNotice = error.message || 'A verificação de segurança não carregou.';
+    updateAccountStatus();
+  }
 }
 
 function readCloudSession() {
@@ -695,7 +849,7 @@ async function synchronizeAllData() {
     showToast('Sincronização concluída. As alterações locais e remotas foram comparadas e atualizadas.');
   } catch (error) {
     console.error('Falha ao sincronizar todos os dados.', error);
-    showToast(error.message || 'Não foi possível concluir a sincronização.', 'error');
+    showToast(userFacingCloudError(error, 'sync'), 'error');
   } finally {
     fullSyncRunning = false;
     buttons.forEach((id) => {
@@ -714,7 +868,7 @@ function syncAfterWake() {
     restoreCloudAccount();
     return;
   }
-  syncCloudNow().catch((error) => updateAccountStatus(error.message || 'Sincronização indisponível'));
+  syncCloudNow().catch((error) => updateAccountStatus(userFacingCloudError(error, 'sync')));
 }
 
 function hasFocusedEditor() {
@@ -748,6 +902,17 @@ function initializeCrossTabSync() {
   });
   document.addEventListener('focusout', scheduleDeferredDraftSync);
   window.addEventListener('focus', syncAfterWake);
+  window.addEventListener('storage', (event) => {
+    if (event.key === CLOUD_OWNER_KEY) {
+      window.location.reload();
+      return;
+    }
+    if (event.key !== CLOUD_SESSION_KEY) return;
+    const sessionUserId = (value) => {
+      try { return JSON.parse(value || 'null')?.user?.id || ''; } catch { return ''; }
+    };
+    if (sessionUserId(event.oldValue) !== sessionUserId(event.newValue)) window.location.reload();
+  });
 }
 
 async function getWorkspaceMembership() {
@@ -1165,7 +1330,7 @@ async function syncCloudNow() {
     syncSucceeded = true;
     updateAccountStatus('Sincronizado');
   } catch (error) {
-    updateAccountStatus(error?.message || 'Falha na sincronização. Tentaremos novamente.');
+    updateAccountStatus(userFacingCloudError(error, 'sync'));
     throw error;
   } finally {
     cloudSyncRunning = false;
@@ -1178,19 +1343,18 @@ async function syncCloudNow() {
 }
 
 async function activateCloudSession(session) {
-  saveCloudSession({ ...session, expires_at: session.expires_at || Math.floor(Date.now() / 1000) + Number(session.expires_in || 3600) });
-  const ownerId = cloudSession?.user?.id || '';
-  let localOwner = '';
-  try { localOwner = localStorage.getItem(CLOUD_OWNER_KEY) || ''; } catch { /* armazenamento local opcional */ }
-  if (localOwner && ownerId && localOwner !== ownerId) {
+  const nextSession = { ...session, expires_at: session.expires_at || Math.floor(Date.now() / 1000) + Number(session.expires_in || 3600) };
+  const ownerId = nextSession.user?.id || '';
+  if (selectLocalDataOwner(ownerId)) {
     cloudWorkspaceId = '';
-    updateAccountStatus('Os dados locais deste dispositivo pertencem a outra conta. Exporte um backup antes de trocar de conta.');
-    showToast('Para proteger seus dados, este dispositivo não sincronizou com a conta diferente.', 'error');
+    cloudWorkspaceName = '';
+    accountProfile = null;
+    saveCloudSession(nextSession);
+    queueLocalDataNotice('A conta foi trocada. Cada usuário mantém seus próprios dados offline neste dispositivo.');
+    window.location.reload();
     return;
   }
-  if (!localOwner && ownerId) {
-    try { localStorage.setItem(CLOUD_OWNER_KEY, ownerId); } catch { /* armazenamento local opcional */ }
-  }
+  saveCloudSession(nextSession);
   if (!navigator.onLine) {
     updateAccountStatus('Conta disponível offline');
     return;
@@ -1202,23 +1366,22 @@ async function activateCloudSession(session) {
     await syncCloudNow();
   } catch (error) {
     console.warn('Não foi possível iniciar a sincronização da conta.', error);
-    updateAccountStatus(error.message || 'Sincronização indisponível');
-    showToast(error.message || 'Não foi possível iniciar a sincronização.', 'error');
+    const message = userFacingCloudError(error, 'sync');
+    updateAccountStatus(message);
+    showToast(message, 'error');
   }
 }
 
 async function restoreCloudAccount() {
   const saved = readCloudSession();
   if (!saved?.access_token) return;
-  cloudWorkspaceId = (() => { try { return localStorage.getItem(CLOUD_WORKSPACE_KEY) || ''; } catch { return ''; } })();
-  saveCloudSession(saved);
-  let localOwner = '';
-  try { localOwner = localStorage.getItem(CLOUD_OWNER_KEY) || ''; } catch { /* armazenamento local opcional */ }
-  if (localOwner && saved.user?.id && localOwner !== saved.user.id) {
-    cloudWorkspaceId = '';
-    updateAccountStatus('Os dados locais deste dispositivo pertencem a outra conta. Exporte um backup antes de trocar de conta.');
+  if (selectLocalDataOwner(saved.user?.id)) {
+    queueLocalDataNotice('A conta foi trocada. Cada usuário mantém seus próprios dados offline neste dispositivo.');
+    window.location.reload();
     return;
   }
+  cloudWorkspaceId = (() => { try { return localStorage.getItem(CLOUD_WORKSPACE_KEY) || ''; } catch { return ''; } })();
+  saveCloudSession(saved);
   if (!cloudConfigured() || !navigator.onLine) {
     updateAccountStatus(navigator.onLine ? 'Configure o Supabase para sincronizar' : 'Conta disponível offline');
     return;
@@ -1226,6 +1389,12 @@ async function restoreCloudAccount() {
   try {
     const session = await usableCloudSession();
     const user = await cloudFetch('/auth/v1/user', { token: session.access_token });
+    if (selectLocalDataOwner(user?.id)) {
+      saveCloudSession({ ...session, user });
+      queueLocalDataNotice('A conta foi trocada. Cada usuário mantém seus próprios dados offline neste dispositivo.');
+      window.location.reload();
+      return;
+    }
     saveCloudSession({ ...session, user });
     await loadAccountProfile(user);
     if (!cloudWorkspaceId) await getWorkspaceMembership();
@@ -1236,7 +1405,7 @@ async function restoreCloudAccount() {
       saveCloudSession(null);
       cloudWorkspaceId = '';
     }
-    updateAccountStatus(error.message || 'Sincronização indisponível');
+    updateAccountStatus(userFacingCloudError(error, 'sync'));
   }
 }
 
@@ -1264,7 +1433,7 @@ function updateAccountStatus(message = '') {
     syncNow.disabled = !navigator.onLine || cloudSyncRunning || fullSyncRunning || !cloudWorkspaceId;
   }
   const submit = document.getElementById('auth-submit');
-  if (submit) submit.disabled = signedIn || !configured;
+  if (submit) submit.disabled = signedIn || !configured || (authCaptchaRequired() && !authCaptchaToken);
   const toggle = document.getElementById('auth-mode-toggle');
   if (toggle) toggle.hidden = signedIn;
   const form = document.getElementById('account-auth-form');
@@ -1281,9 +1450,14 @@ function renderAuthMode() {
   const nameField = document.getElementById('auth-name-field');
   const workspaceField = document.getElementById('auth-workspace-field');
   const password = document.getElementById('auth-password');
+  const fullName = document.getElementById('auth-full-name');
+  const confirmationField = document.getElementById('auth-confirm-password-field');
+  const confirmation = document.getElementById('auth-confirm-password');
+  const passwordHint = document.getElementById('auth-password-hint');
   const submit = document.getElementById('auth-submit');
   const toggle = document.getElementById('auth-mode-toggle');
   const forgot = document.getElementById('auth-forgot-button');
+  const resend = document.getElementById('auth-resend-confirmation');
   const title = document.getElementById('account-modal-title');
   if (loginView) loginView.hidden = !authView;
   if (recoveryRequest) recoveryRequest.hidden = authMode !== 'recovery-request';
@@ -1291,13 +1465,26 @@ function renderAuthMode() {
   if (accountView) accountView.hidden = authMode !== 'account';
   if (nameField) nameField.hidden = !creating;
   if (workspaceField) workspaceField.hidden = !creating;
+  if (fullName) {
+    fullName.required = creating;
+    fullName.disabled = !creating;
+  }
+  const workspaceName = document.getElementById('auth-workspace-name');
+  if (workspaceName) workspaceName.disabled = !creating;
   if (password) password.autocomplete = creating ? 'new-password' : 'current-password';
-  if (password) password.minLength = creating ? 8 : 1;
+  if (password) password.minLength = creating ? MIN_PASSWORD_LENGTH : 1;
   if (password) password.required = authView;
+  if (confirmationField) confirmationField.hidden = !creating;
+  if (confirmation) {
+    confirmation.required = creating;
+    confirmation.disabled = !creating;
+  }
+  if (passwordHint) passwordHint.hidden = !creating;
   if (submit) submit.textContent = creating ? 'Criar conta' : 'Entrar';
   if (toggle) toggle.textContent = creating ? 'Já tenho uma conta' : 'Criar conta';
   if (toggle) toggle.hidden = !authView || Boolean(cloudSession?.user);
   if (forgot) forgot.hidden = authMode !== 'login' || Boolean(cloudSession?.user);
+  if (resend) resend.hidden = authMode !== 'login' || !pendingConfirmationEmail || Boolean(cloudSession?.user);
   if (title) {
     const titles = {
       login: 'Entrar e sincronizar',
@@ -1308,6 +1495,7 @@ function renderAuthMode() {
     };
     title.textContent = titles[authMode] || titles.login;
   }
+  renderAuthCaptcha();
 }
 
 function openAccountModal() {
@@ -1317,36 +1505,77 @@ function openAccountModal() {
   updateAccountStatus();
   const modal = document.getElementById('account-modal');
   if (modal) modal.hidden = false;
+  renderAuthCaptcha();
   if (authMode === 'account') {
     fillAccountProfileForm();
-    loadAccountProfile().catch((error) => updateAccountStatus(error.message || 'Não foi possível carregar o perfil.'));
+    loadAccountProfile().catch((error) => updateAccountStatus(userFacingCloudError(error, 'profile')));
   }
 }
 
 async function submitCloudAuth(event) {
   event.preventDefault();
   if (!cloudConfigured()) {
-    showToast('A sincronização será ativada após configurar o projeto Supabase.', 'error');
+    authNotice = 'A sincronização será ativada após configurar o projeto Supabase.';
+    updateAccountStatus();
     return;
   }
-  const email = document.getElementById('auth-email')?.value.trim();
+  let email = document.getElementById('auth-email')?.value.trim().toLowerCase() || '';
   const password = document.getElementById('auth-password')?.value;
   const creating = authMode === 'signup';
   authNotice = '';
+  let fullName = '';
+  if (creating) {
+    const validation = validateRegistration({
+      fullName: document.getElementById('auth-full-name')?.value,
+      email,
+      password,
+      confirmation: document.getElementById('auth-confirm-password')?.value,
+    });
+    if (!validation.ok) {
+      authNotice = validation.message;
+      updateAccountStatus();
+      return;
+    }
+    email = validation.email;
+    fullName = validation.fullName;
+  }
+  if (authCaptchaRequired() && !authCaptchaToken) {
+    authNotice = 'Complete a verificação de segurança antes de continuar.';
+    updateAccountStatus();
+    return;
+  }
+  const captcha = authCaptchaPayload();
   const body = creating ? {
-    email, password,
+    email,
+    password,
+    ...captcha,
     data: {
-      full_name: document.getElementById('auth-full-name')?.value.trim() || '',
+      full_name: fullName,
       workspace_name: document.getElementById('auth-workspace-name')?.value.trim() || '',
     },
-  } : { email, password };
+  } : { email, password, ...captcha };
   const submit = document.getElementById('auth-submit');
   if (submit) { submit.disabled = true; submit.textContent = creating ? 'Criando…' : 'Entrando…'; }
   try {
     const response = creating
       ? await cloudFetch('/auth/v1/signup', { method: 'POST', token: cloudConfig().key, body })
       : await cloudFetch('/auth/v1/token?grant_type=password', { method: 'POST', token: cloudConfig().key, body });
-    if (response?.access_token) {
+    if (creating) {
+      pendingConfirmationEmail = email;
+      authMode = 'login';
+      document.getElementById('account-auth-form')?.reset();
+      setValue('auth-email', email);
+      if (response?.access_token) {
+        try {
+          await cloudFetch('/auth/v1/logout', { method: 'POST', body: {}, token: response.access_token });
+        } catch { /* a sessão nunca é guardada antes da confirmação */ }
+        authNotice = 'A confirmação por e-mail não está ativa para este cadastro. A conta não foi conectada. Tente novamente mais tarde ou fale com o suporte.';
+      } else {
+        authNotice = 'Solicitação recebida. Se este endereço puder concluir o cadastro, enviaremos um link de confirmação. Confira também a caixa de spam.';
+      }
+    } else if (response?.access_token) {
+      pendingConfirmationEmail = '';
+      authNotice = '';
       await activateCloudSession({ ...response, user: response.user });
       if (cloudSession?.access_token) {
         document.getElementById('account-modal').hidden = true;
@@ -1354,41 +1583,78 @@ async function submitCloudAuth(event) {
         authMode = 'account';
       }
       showToast('Conta GrafiFlow conectada.');
-    } else if (creating) {
-      authNotice = 'Cadastro criado. Abra o e-mail e use o botão Confirmar cadastro. Depois, entre com sua senha.';
-      authMode = 'login';
-      document.getElementById('account-auth-form')?.reset();
-      setValue('auth-email', email);
     } else {
       throw new Error('O Supabase não retornou uma sessão. Verifique o e-mail e a senha.');
     }
   } catch (error) {
-    const message = String(error.message || 'Não foi possível conectar a conta.');
-    if (/invalid login credentials|invalid credentials/i.test(message)) showToast('E-mail ou senha incorretos.', 'error');
-    else if (/email not confirmed/i.test(message)) showToast('Confirme o cadastro pelo link enviado ao e-mail antes de entrar.', 'error');
-    else showToast(message, 'error');
+    if (/email not confirmed|email_not_confirmed/i.test(String(error.message || error.code || ''))) {
+      pendingConfirmationEmail = email;
+      setValue('auth-email', email);
+    }
+    authNotice = userFacingAuthError(error, creating ? 'signup' : 'login');
   } finally {
-    if (submit) submit.disabled = !cloudConfigured() || Boolean(cloudSession);
+    resetAuthCaptcha();
     renderAuthMode();
+    updateAccountStatus();
+  }
+}
+
+async function resendSignupConfirmation() {
+  const email = (document.getElementById('auth-email')?.value || '').trim().toLowerCase() || pendingConfirmationEmail.trim().toLowerCase();
+  if (!email) {
+    authNotice = 'Informe o e-mail usado no cadastro.';
+    updateAccountStatus();
+    return;
+  }
+  if (authCaptchaRequired() && !authCaptchaToken) {
+    authNotice = 'Complete a verificação de segurança antes de reenviar.';
+    updateAccountStatus();
+    return;
+  }
+  const button = document.getElementById('auth-resend-confirmation');
+  if (button) button.disabled = true;
+  try {
+    await cloudFetch('/auth/v1/resend', {
+      method: 'POST',
+      token: cloudConfig().key,
+      body: { type: 'signup', email, ...authCaptchaPayload() },
+    });
+    pendingConfirmationEmail = email;
+    authNotice = 'Se a confirmação ainda for necessária, enviaremos um novo link. Confira a caixa de entrada e o spam.';
+  } catch (error) {
+    authNotice = userFacingAuthError(error, 'resend');
+  } finally {
+    resetAuthCaptcha();
+    if (button) button.disabled = false;
     updateAccountStatus();
   }
 }
 
 async function submitPasswordRecoveryRequest(event) {
   event.preventDefault();
-  if (!cloudConfigured()) return showToast('A conexão com o Supabase ainda não foi configurada.', 'error');
+  if (!cloudConfigured()) {
+    authNotice = 'A conexão com o Supabase ainda não foi configurada.';
+    updateAccountStatus();
+    return;
+  }
   const email = profileValue('recover-email').toLowerCase();
+  if (authCaptchaRequired() && !authCaptchaToken) {
+    authNotice = 'Complete a verificação de segurança antes de continuar.';
+    updateAccountStatus();
+    return;
+  }
   const button = document.getElementById('recover-submit');
   if (button) button.disabled = true;
   try {
-    await cloudFetch('/auth/v1/recover', { method: 'POST', token: cloudConfig().key, body: { email } });
+    await cloudFetch('/auth/v1/recover', { method: 'POST', token: cloudConfig().key, body: { email, ...authCaptchaPayload() } });
     authMode = 'login';
     authNotice = 'Se houver uma conta para esse e-mail, enviaremos uma mensagem com o botão seguro para redefinir a senha.';
     setValue('auth-email', email);
     document.getElementById('recovery-request-form')?.reset();
   } catch (error) {
-    showToast(error.message || 'Não foi possível solicitar a recuperação.', 'error');
+    authNotice = userFacingAuthError(error, 'recovery');
   } finally {
+    resetAuthCaptcha();
     if (button) button.disabled = false;
     renderAuthMode();
     updateAccountStatus();
@@ -1399,7 +1665,7 @@ async function submitRecoveredPassword(event) {
   event.preventDefault();
   const nextPassword = document.getElementById('recovery-new-password')?.value || '';
   const confirmation = document.getElementById('recovery-confirm-password')?.value || '';
-  if (nextPassword.length < 8) return showToast('A nova senha deve ter pelo menos 8 caracteres.', 'error');
+  if (nextPassword.length < MIN_PASSWORD_LENGTH) return showToast(`A nova senha deve ter pelo menos ${MIN_PASSWORD_LENGTH} caracteres.`, 'error');
   if (nextPassword !== confirmation) return showToast('As novas senhas não coincidem.', 'error');
   if (!cloudSession?.access_token) return showToast('O link de recuperação expirou. Solicite outro e-mail.', 'error');
   const button = document.getElementById('recovery-submit');
@@ -1414,7 +1680,7 @@ async function submitRecoveredPassword(event) {
     updateAccountStatus();
     showToast('Senha redefinida com sucesso.');
   } catch (error) {
-    showToast(error.message || 'Não foi possível redefinir a senha.', 'error');
+    showToast(userFacingAuthError(error, 'recovery'), 'error');
   } finally {
     if (button) button.disabled = false;
   }
@@ -1425,16 +1691,23 @@ async function submitPasswordChange(event) {
   const currentPassword = document.getElementById('password-current')?.value || '';
   const nextPassword = document.getElementById('password-new')?.value || '';
   const confirmation = document.getElementById('password-confirm')?.value || '';
-  if (nextPassword.length < 8) return showToast('A nova senha deve ter pelo menos 8 caracteres.', 'error');
+  if (nextPassword.length < MIN_PASSWORD_LENGTH) return showToast(`A nova senha deve ter pelo menos ${MIN_PASSWORD_LENGTH} caracteres.`, 'error');
   if (nextPassword !== confirmation) return showToast('As novas senhas não coincidem.', 'error');
   if (nextPassword === currentPassword) return showToast('Escolha uma senha diferente da senha atual.', 'error');
   const email = cloudSession?.user?.email;
   if (!email || !cloudConfigured()) return showToast('Entre novamente para trocar a senha.', 'error');
+  if (authCaptchaSiteKey() && !authCaptchaToken) {
+    authCaptchaForPasswordChange = true;
+    authNotice = 'Conclua a verificação de segurança e toque em “Atualizar senha” novamente.';
+    await renderAuthCaptcha();
+    updateAccountStatus();
+    return;
+  }
   const button = document.getElementById('password-change-button');
   if (button) button.disabled = true;
   try {
     const verified = await cloudFetch('/auth/v1/token?grant_type=password', {
-      method: 'POST', token: cloudConfig().key, body: { email, password: currentPassword },
+      method: 'POST', token: cloudConfig().key, body: { email, password: currentPassword, ...authCaptchaPayload() },
     });
     if (!verified?.access_token) throw new Error('Não foi possível confirmar a senha atual.');
     const user = await cloudFetch('/auth/v1/user', { method: 'PUT', body: { password: nextPassword }, token: verified.access_token });
@@ -1444,9 +1717,12 @@ async function submitPasswordChange(event) {
     updateAccountStatus();
     showToast('Senha atualizada com sucesso.');
   } catch (error) {
-    const message = String(error.message || 'Não foi possível atualizar a senha.');
-    showToast(/invalid login credentials|invalid credentials/i.test(message) ? 'A senha atual está incorreta.' : message, 'error');
+    const message = String(error.message || '');
+    showToast(/invalid login credentials|invalid credentials/i.test(message) ? 'A senha atual está incorreta.' : userFacingAuthError(error, 'login'), 'error');
   } finally {
+    resetAuthCaptcha();
+    authCaptchaForPasswordChange = false;
+    renderAuthCaptcha();
     if (button) button.disabled = false;
   }
 }
@@ -1487,7 +1763,7 @@ async function submitAccountProfile(event) {
     updateAccountStatus();
     showToast('Dados da conta atualizados.');
   } catch (error) {
-    showToast(error.message || 'Não foi possível salvar os dados da conta.', 'error');
+    showToast(userFacingCloudError(error, 'profile'), 'error');
   } finally {
     if (button) button.disabled = false;
   }
@@ -1500,13 +1776,15 @@ async function handleAuthCallback() {
   const accessToken = params.get('access_token') || '';
   const errorDescription = params.get('error_description') || params.get('error') || queryParams.get('error_description') || queryParams.get('error') || '';
   if (!type && !accessToken && !errorDescription) return false;
-  window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.search}`);
+  window.history.replaceState({}, document.title, window.location.pathname);
   if (errorDescription) {
     authMode = 'login';
-    authNotice = errorDescription;
+    authNotice = userFacingAuthError(errorDescription, 'login');
+    pendingConfirmationEmail = params.get('email') || queryParams.get('email') || pendingConfirmationEmail;
     renderAuthMode();
     updateAccountStatus();
     document.getElementById('account-modal').hidden = false;
+    renderAuthCaptcha();
     return true;
   }
   if (!accessToken) return false;
@@ -1519,6 +1797,9 @@ async function handleAuthCallback() {
       token_type: params.get('token_type') || 'bearer',
     };
     session.user = await cloudFetch('/auth/v1/user', { token: accessToken });
+    if (type === 'signup' && !(session.user?.email_confirmed_at || session.user?.confirmed_at)) {
+      throw new Error('email not confirmed');
+    }
     saveCloudSession(session);
     if (type === 'recovery') {
       await loadAccountProfile(session.user);
@@ -1527,24 +1808,38 @@ async function handleAuthCallback() {
       renderAuthMode();
       updateAccountStatus();
       document.getElementById('account-modal').hidden = false;
+      renderAuthCaptcha();
       return true;
     }
     await activateCloudSession(session);
     document.getElementById('account-modal').hidden = true;
     authNotice = '';
+    pendingConfirmationEmail = '';
     showToast('E-mail confirmado. Sua conta GrafiFlow está pronta.');
     return true;
   } catch (error) {
     authMode = 'login';
-    authNotice = error.message || 'Não foi possível validar o link. Solicite uma nova mensagem.';
+    authNotice = userFacingAuthError(error, 'login');
     renderAuthMode();
     updateAccountStatus();
     document.getElementById('account-modal').hidden = false;
+    renderAuthCaptcha();
     return true;
   }
 }
 
 async function signOutCloudAccount() {
+  if (cloudSyncRunning || fullSyncRunning) {
+    showToast('Aguarde a sincronização terminar antes de sair da conta.', 'error');
+    return;
+  }
+  clearTimeout(cloudSyncTimer);
+  fullSyncRunning = true;
+  try {
+    await storePut('settings', { key: 'draft', value: clone(state), updatedAt: new Date().toISOString(), cloudIntent: true });
+  } catch { /* o conteúdo já salvo continua no IndexedDB */ }
+  fullSyncRunning = false;
+  clearTimeout(cloudSyncTimer);
   try {
     if (cloudSession?.access_token && navigator.onLine && cloudConfigured()) {
       await cloudFetch('/auth/v1/logout', { method: 'POST', body: {}, token: cloudSession.access_token });
@@ -1558,11 +1853,16 @@ async function signOutCloudAccount() {
   accountProfile = null;
   authNotice = '';
   authMode = 'login';
-  try { localStorage.removeItem(CLOUD_WORKSPACE_KEY); } catch { /* armazenamento local opcional */ }
-  document.getElementById('account-modal').hidden = true;
-  renderAuthMode();
-  updateAccountStatus();
-  showToast('Sessão encerrada. Os dados locais foram mantidos.');
+  pendingConfirmationEmail = '';
+  authCaptchaForPasswordChange = false;
+  resetAuthCaptcha();
+  try {
+    localStorage.removeItem(CLOUD_OWNER_KEY);
+    localStorage.removeItem(CLOUD_WORKSPACE_KEY);
+    localStorage.removeItem(SYNC_CURSOR_KEY);
+  } catch { /* as preferências locais são opcionais */ }
+  queueLocalDataNotice('Sessão encerrada. Os dados desta conta foram mantidos em um espaço local separado.');
+  window.location.reload();
 }
 
 async function loadPersistence() {
@@ -3482,19 +3782,23 @@ function handleClick(event) {
   if (id === 'profile-use-account-address') copyAccountAddressToQuote();
   if (id === 'close-account-modal' || id === 'cancel-account-modal') document.getElementById('account-modal').hidden = true;
   if (id === 'auth-mode-toggle') {
+    resetAuthCaptcha();
     authMode = authMode === 'signup' ? 'login' : 'signup';
     authNotice = '';
     renderAuthMode();
     updateAccountStatus();
   }
   if (id === 'auth-forgot-button') {
+    resetAuthCaptcha();
     authMode = 'recovery-request';
     authNotice = 'Informe seu e-mail e enviaremos um link para criar uma nova senha.';
     setValue('recover-email', document.getElementById('auth-email')?.value || '');
     renderAuthMode();
     updateAccountStatus();
   }
+  if (id === 'auth-resend-confirmation') resendSignupConfirmation();
   if (id === 'auth-back-to-login' || id === 'recovery-back-to-login') {
+    resetAuthCaptcha();
     authMode = 'login';
     authNotice = '';
     renderAuthMode();
@@ -3600,9 +3904,16 @@ function initialize() {
   loadPersistence().then(() => {
     if (!state.pieces.length) state.pieces.push(defaultPiece(state.materials[0]?.id));
     renderAll({ persistDraft: false });
+    try {
+      const notice = localStorage.getItem(LOCAL_DATA_NOTICE_KEY) || '';
+      if (notice) {
+        localStorage.removeItem(LOCAL_DATA_NOTICE_KEY);
+        showToast(notice);
+      }
+    } catch { /* aviso temporário */ }
     handleAuthCallback().then((handled) => { if (!handled) restoreCloudAccount(); });
   });
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261007-phone-pdf-button-v1').catch(() => undefined);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js?v=20261025-cloud-error-v2').catch(() => undefined);
 }
 
 initialize();
