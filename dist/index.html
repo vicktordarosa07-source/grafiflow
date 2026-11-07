@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest?v=20261101-billing-runtime-config" />
     <link rel="icon" href="./metriflow-favicon.png" type="image/png" sizes="64x64" />
     <link rel="apple-touch-icon" href="./metriflow-icon-192.png" />
-    <link rel="stylesheet" href="./styles.css?v=20261107-team-ops-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20261107-mobile-pdf-v1" />
     <title>MetriFlow — orçamento gráfico</title>
   </head>
   <body class="auth-pending">
@@ -88,6 +88,7 @@
 
         <div class="content-wrap">
           <section class="view active" id="calculator-view" aria-labelledby="calculator-heading">
+            <button class="primary-button mobile-pdf-button" id="mobile-pdf-button" type="button">Gerar PDF para cliente</button>
             <div class="workspace-intro">
               <div>
                 <p class="section-kicker">APROVEITAMENTO RETANGULAR</p>
@@ -449,7 +450,7 @@
     <div class="modal-backdrop client-quote-modal" id="client-quote-modal" hidden>
       <div class="modal-card client-quote-modal-card" role="dialog" aria-modal="true" aria-labelledby="client-quote-modal-title">
         <div class="modal-heading client-quote-modal-heading">
-          <div><span class="section-kicker">DOCUMENTO EXTERNO</span><h2 id="client-quote-modal-title">Orçamento para o cliente</h2><p class="muted-copy">Revise os dados e depois salve a versão limpa em PDF.</p></div>
+          <div><span class="section-kicker">DOCUMENTO EXTERNO</span><h2 id="client-quote-modal-title">Orçamento para o cliente</h2><p class="muted-copy">Confira a prévia. O PDF é gerado no aparelho e não inclui custos nem lucro interno.</p></div>
           <button class="icon-button" id="close-client-quote-modal" type="button" aria-label="Fechar">×</button>
         </div>
         <div class="client-quote-workspace">
@@ -460,10 +461,11 @@
           </section>
           <section class="client-quote-preview-wrap" aria-label="Prévia do documento"><div id="client-quote-preview" class="client-quote-preview"></div></section>
         </div>
-        <div class="client-quote-modal-actions"><button class="secondary-button" id="cancel-client-quote" type="button">Voltar</button><button class="primary-button" id="client-quote-print" type="button">Imprimir / salvar PDF</button></div>
+        <p class="client-quote-pdf-status" id="client-quote-pdf-status" role="status" aria-live="polite"></p>
+        <div class="client-quote-modal-actions"><button class="secondary-button" id="cancel-client-quote" type="button">Voltar</button><button class="secondary-button" id="client-quote-download" type="button" hidden>Baixar PDF</button><button class="primary-button" id="client-quote-share" type="button" hidden>Compartilhar PDF</button><button class="primary-button" id="client-quote-save-and-prepare" type="button" hidden>Salvar e preparar PDF</button></div>
       </div>
     </div>
     <script src="./api/config?v=20261103-metriflow-rebrand"></script>
-    <script type="module" src="./app.js?v=20261107-team-ops-v1"></script>
+    <script type="module" src="./app.js?v=20261107-mobile-pdf-v1"></script>
   </body>
 </html>
