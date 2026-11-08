@@ -1,9 +1,9 @@
-const CACHE_NAME = 'metriflow-static-v58';
+const CACHE_NAME = 'metriflow-static-v59';
 const APP_SHELL = [
   './',
   './index.html',
   './styles.css?v=20261107-mobile-pdf-v2',
-  './app.js?v=20261107-mobile-pdf-v1',
+  './app.js?v=20261108-sync-error-status-v1',
   './vendor/html2pdf.bundle.min.js?v=0.14.0',
   './money-input.js',
   './offline-billing.js',
